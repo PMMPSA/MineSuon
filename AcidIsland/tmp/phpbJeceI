@@ -1,0 +1,4434 @@
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper;
+
+use BlockHorizons\BlockSniper\brush\registration\ShapeRegistration;
+use BlockHorizons\BlockSniper\brush\registration\TypeRegistration;
+use BlockHorizons\BlockSniper\commands\BlockSniperCommand;
+use BlockHorizons\BlockSniper\commands\BrushCommand;
+use BlockHorizons\BlockSniper\commands\cloning\CloneCommand;
+use BlockHorizons\BlockSniper\commands\cloning\PasteCommand;
+use BlockHorizons\BlockSniper\commands\RedoCommand;
+use BlockHorizons\BlockSniper\commands\UndoCommand;
+use BlockHorizons\BlockSniper\data\ConfigData;
+use BlockHorizons\BlockSniper\data\Translation;
+use BlockHorizons\BlockSniper\data\TranslationData;
+use BlockHorizons\BlockSniper\listeners\BrushListener;
+use BlockHorizons\BlockSniper\presets\PresetManager;
+use BlockHorizons\BlockSniper\sessions\SessionManager;
+use BlockHorizons\BlockSniper\tasks\RedoDiminishTask;
+use BlockHorizons\BlockSniper\tasks\UndoDiminishTask;
+use BlockHorizons\BlockSniper\tasks\UpdateNotifyTask;
+use MyPlot\MyPlot;
+use pocketmine\plugin\PluginBase;
+use pocketmine\utils\TextFormat as TF;
+
+class Loader extends PluginBase{
+
+	public const VERSION = "3.2.3";
+	public const CONFIGURATION_VERSION = "4.2.0";
+	public const API_TARGET = "3.2.0";
+
+	private const AUTOLOAD_LIBRARIES = [
+		"marshal",
+		"schematic"
+	];
+
+	/** @var string[] */
+	private static $availableLanguages = [
+		"en",
+		"nl",
+		"fr",
+		"ko",
+		"ja",
+		"zh-hans",
+		"zh-hant",
+		"es"
+	];
+	/** @var TranslationData */
+	private $language = null;
+	/** @var PresetManager */
+	private $presetManager = null;
+	/** @var ConfigData */
+	public $config = null;
+
+	/** @var null|MyPlot */
+	private $myPlot = null;
+
+	/**
+	 * @return string[]
+	 */
+	public static function getAvailableLanguages() : array{
+		return self::$availableLanguages;
+	}
+
+	public function onLoad() : void{
+		foreach(self::AUTOLOAD_LIBRARIES as $name){
+			$this->getServer()->getLoader()->addPath($this->getFile() . "src/$name/src");
+		}
+
+		$this->getServer()->getAsyncPool()->submitTask(new UpdateNotifyTask());
+	}
+
+	public function onEnable() : void{
+		$this->load();
+
+		$this->registerCommands();
+		$this->registerListeners();
+
+		$this->getScheduler()->scheduleRepeatingTask(new UndoDiminishTask($this), 400);
+		$this->getScheduler()->scheduleRepeatingTask(new RedoDiminishTask($this), 400);
+	}
+
+	public function onDisable() : void{
+		$this->getPresetManager()->storePresetsToFile();
+		SessionManager::close();
+		$this->config->close();
+	}
+
+	public function reload() : void{
+		$this->onDisable();
+		$this->load();
+	}
+
+	/**
+	 * @return PresetManager
+	 */
+	public function getPresetManager() : PresetManager{
+		return $this->presetManager;
+	}
+
+	private function load() : void{
+		$this->initializeDirectories();
+
+		$this->config = new ConfigData($this);
+		$this->language = new TranslationData($this);
+		$this->presetManager = new PresetManager($this);
+
+		if(!$this->language->collectTranslations()){
+			$this->getLogger()->info(Translation::get(Translation::LOG_LANGUAGE_AUTO_SELECTED));
+			$this->getLogger()->info(Translation::get(Translation::LOG_LANGUAGE_USAGE));
+		}else{
+			$this->getLogger()->info(Translation::get(Translation::LOG_LANGUAGE_SELECTED) . TF::GREEN . $this->config->messageLanguage);
+		}
+
+		ShapeRegistration::init();
+		TypeRegistration::init();
+
+		if($this->config->myPlotSupport){
+			$this->myPlot = $this->getServer()->getPluginManager()->getPlugin("MyPlot");
+		}
+	}
+
+	public function initializeDirectories() : void{
+		if(!is_dir($this->getDataFolder())){
+			mkdir($this->getDataFolder());
+		}
+		if(!is_dir($this->getDataFolder() . "templates/")){
+			mkdir($this->getDataFolder() . "templates/");
+		}
+		if(!is_dir($this->getDataFolder() . "schematics/")){
+			mkdir($this->getDataFolder() . "schematics/");
+		}
+		if(!is_dir($this->getDataFolder() . "languages/")){
+			mkdir($this->getDataFolder() . "languages/");
+		}
+		if(!is_dir($this->getDataFolder() . "sessions/")){
+			mkdir($this->getDataFolder() . "sessions/");
+		}
+		if(!is_dir($this->getDataFolder() . "presets/")){
+			mkdir($this->getDataFolder() . "presets/");
+		}
+	}
+
+	/**
+	 * @return TranslationData
+	 */
+	public function getTranslationData() : TranslationData{
+		return $this->language;
+	}
+
+	/**
+	 * @return MyPlot|null
+	 */
+	public function getMyPlot() : ?MyPlot{
+		return $this->myPlot;
+	}
+
+	/**
+	 * @return bool
+	 */
+	public function isMyPlotAvailable() : bool{
+		return $this->myPlot !== null;
+	}
+
+	private function registerCommands() : void{
+		$this->getServer()->getCommandMap()->registerAll("blocksniper", [
+			new BlockSniperCommand($this),
+			new BrushCommand($this),
+			new UndoCommand($this),
+			new RedoCommand($this),
+			new CloneCommand($this),
+			new PasteCommand($this)
+		]);
+	}
+
+	private function registerListeners() : void{
+		$listeners = [
+			new BrushListener($this),
+		];
+		foreach($listeners as $listener){
+			$this->getServer()->getPluginManager()->registerEvents($listener, $this);
+		}
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\tasks;
+
+use BlockHorizons\BlockSniper\Loader;
+use pocketmine\scheduler\AsyncTask;
+use pocketmine\Server;
+use pocketmine\utils\Internet;
+
+class UpdateNotifyTask extends AsyncTask{
+
+	private const RELEASES_URL = "https://poggit.pmmp.io/releases.json?name=BlockSniper";
+
+	public function onRun() : void{
+		$json = Internet::getURL(self::RELEASES_URL, 10, [], $err);
+		$highestVersion = Loader::VERSION;
+		$artifactUrl = "";
+		$api = "";
+		if($json !== false){
+			$releases = json_decode($json, true);
+			foreach($releases as $release){
+				if(version_compare($highestVersion, $release["version"], ">=")){
+					continue;
+				}
+				$highestVersion = $release["version"];
+				$artifactUrl = $release["artifact_url"];
+				$api = $release["api"][0]["from"] . " - " . $release["api"][0]["to"];
+			}
+		}
+
+		$this->setResult([$highestVersion, $artifactUrl, $api, $err]);
+	}
+
+	public function onCompletion(Server $server) : void{
+		/** @var Loader|null $loader */
+		$loader = $server->getPluginManager()->getPlugin("BlockSniper");
+		if($loader === null){
+			return;
+		}
+		[$highestVersion, $artifactUrl, $api, $err] = $this->getResult();
+		if($err !== null){
+			$loader->getLogger()->error("Update notify error: " . $err);
+		}
+		if($highestVersion === Loader::VERSION){
+			return;
+		}
+		$artifactUrl = $artifactUrl . "/BlockSniper_" . $highestVersion . ".phar";
+		$loader->getLogger()->info(vsprintf("Version %s has been released for API %s. Download the new release at %s",
+											[$highestVersion, $api, $artifactUrl]));
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\data;
+
+use BlockHorizons\BlockSniper\Loader;
+use pocketmine\item\Item;
+use pocketmine\item\ItemIds;
+use Sandertv\Marshal\DecodeException;
+use Sandertv\Marshal\FileNotFoundException;
+use Sandertv\Marshal\Marshal;
+use Sandertv\Marshal\Unmarshal;
+
+class ConfigData{
+	private $filePath = "";
+
+	/**
+	 * @var string
+	 * @marshal Configuration Version
+	 */
+	public $configurationVersion = ""; // Default to an outdated version, so we can properly detect outdated configs.
+	/**
+	 * @var string
+	 * @marshal Message Language
+	 */
+	public $messageLanguage = "en";
+	/**
+	 * @var BrushItem
+	 * @marshal Brush Item
+	 */
+	public $brushItem;
+	/**
+	 * @var BrushItem
+	 * @marshal Selection Item
+	 */
+	public $selectionItem;
+	/**
+	 * @var int
+	 * @marshal Maximum Size
+	 */
+	public $maxSize = 30;
+	/**
+	 * @var int
+	 * @marshal Asynchronous Operation Size
+	 */
+	public $asyncOperationSize = 15;
+	/**
+	 * @var int
+	 * @marshal Maximum Revert Stores
+	 */
+	public $maxRevertStores = 15;
+	/**
+	 * @var bool
+	 * @marshal Reset Decrement Brush
+	 */
+	public $resetDecrementBrush = true;
+	/**
+	 * @var bool
+	 * @marshal Save Brush Properties
+	 */
+	public $saveBrushProperties = true;
+	/**
+	 * @var bool
+	 * @marshal Drop Leaf Blower Plants
+	 */
+	public $dropLeafBlowerPlants = true;
+	/**
+	 * @var int
+	 * @marshal Session Timeout Time in minutes
+	 */
+	public $sessionTimeoutTime = 5;
+	/**
+	 * @var bool
+	 * @marshal Open GUI Automatically
+	 */
+	public $openGuiAutomatically = true;
+	/**
+	 * @var bool
+	 * @marshal MyPlot Support
+	 */
+	public $myPlotSupport = false;
+
+	public function __construct(Loader $loader){
+		$this->brushItem = new BrushItem();
+		$this->selectionItem = new BrushItem();
+		$this->selectionItem->itemId = ItemIds::GLOWSTONE_DUST;
+
+		$this->filePath = $loader->getDataFolder() . "config.yml";
+
+		try{
+			Unmarshal::yamlFile($this->filePath, $this);
+		}catch(FileNotFoundException $exception){
+			// Make sure to set the right version right off the bat.
+			$this->configurationVersion = Loader::CONFIGURATION_VERSION;
+			Marshal::yamlFile($this->filePath, $this);
+		}catch(\ErrorException $exception){
+			// PM's error handler will create this error exception, causing the DecodeException not to be thrown at all.
+			$loader->getLogger()->error("Configuration corrupted. config.yml has been renamed to config_corrupted.yml and a new config.yml has been generated.");
+			rename($this->filePath, $loader->getDataFolder() . "config_corrupted.yml");
+			// Make sure to set the right version right off the bat.
+			$this->configurationVersion = Loader::CONFIGURATION_VERSION;
+			Marshal::yamlFile($this->filePath, $this);
+		}catch(DecodeException $e){
+			// Never hit because of the block above.
+		}
+
+		// We can retain backwards compatibility with old configuration most of the times, but the fact that the version
+		// was empty means that the configuration was completely unrecoverable. We'll generate a new one.
+		if($this->configurationVersion === ""){
+			$loader->getLogger()->notice("Outdated configuration. config.yml has been renamed to config_old.yml and a new config.yml has been generated.");
+			rename($this->filePath, $loader->getDataFolder() . "config_old.yml");
+			// Set the new configuration version so we don't end in an infinite loop.
+			$this->configurationVersion = Loader::CONFIGURATION_VERSION;
+			Marshal::yamlFile($this->filePath, $this);
+		}
+	}
+
+	public function close() : void{
+		Marshal::yamlFile($this->filePath, $this);
+	}
+}
+
+class BrushItem{
+	/**
+	 * @var int
+	 * @marshal Item ID
+	 */
+	public $itemId = 396;
+	/**
+	 * @var int
+	 * @marshal Item Data
+	 */
+	public $itemData = 0;
+
+	public function parse() : Item{
+		return Item::get($this->itemId, $this->itemData);
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace Sandertv\Marshal;
+
+require("DataProcessor.php");
+require("DecodeException.php");
+require("FileNotFoundException.php");
+
+class Unmarshal{
+
+	/**
+	 * json decodes a JSON string into $obj.
+	 *
+	 * @param string  $json to decode.
+	 * @param \object $obj to decode the JSON into.
+	 *
+	 * @throws DecodeException when $json is invalid JSON data.
+	 */
+	public static function json(string $json, object $obj) : void{
+		$data = json_decode($json, true);
+		if($data === null){
+			throw new DecodeException("Unmarshal::Json: Invalid JSON string provided");
+		}
+		$processor = new DataProcessor();
+		$processor->put($obj, $data);
+	}
+
+	/**
+	 * jsonFile gets the content from $file, and decodes JSON data found in the file into $obj.
+	 *
+	 * @param string  $file to parse JSON from.
+	 * @param \object $obj to decode the parsed JSON into.
+	 *
+	 * @throws DecodeException when the JSON from $file is invalid JSON data.
+	 * @throws FileNotFoundException when $file can not be found.
+	 */
+	public static function jsonFile(string $file, object $obj) : void{
+		if(!file_exists($file)){
+			throw new FileNotFoundException("Unmarshal::JsonFile: File $file could not be found");
+		}
+		$fileContent = file_get_contents($file);
+		self::json($fileContent, $obj);
+	}
+
+	/**
+	 * yaml decodes YAML string $yaml into object $obj.
+	 *
+	 * @param string  $yaml to decode.
+	 * @param \object $obj to decode the YAML into.
+	 *
+	 * @throws DecodeException when $yaml is invalid YAML data.
+	 */
+	public static function yaml(string $yaml, object $obj) : void{
+		$data = yaml_parse($yaml);
+		if($data === false){
+			throw new DecodeException("Unmarshal::Yaml: Invalid YAML string provided");
+		}
+		$processor = new DataProcessor();
+		$processor->put($obj, $data);
+	}
+
+	/**
+	 * yamlFile gets the content from $file and decodes the YAML parsed into $obj.
+	 *
+	 * @param string  $file to parse YAML from.
+	 * @param \object $obj to decode the parsed YAML into.
+	 *
+	 * @throws DecodeException if $file's content was no valid YAML.
+	 * @throws FileNotFoundException if $file could not be found.
+	 */
+	public static function yamlFile(string $file, object $obj) : void{
+		if(!file_exists($file)){
+			throw new FileNotFoundException("Unmarshal::YamlFile: File $file could not be found");
+		}
+		$fileContent = file_get_contents($file);
+		self::yaml($fileContent, $obj);
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace Sandertv\Marshal;
+
+class DataProcessor{
+
+	/**
+	 * TAG_MARSHAL is the tag used to define a different name for marshalling. '-' may be used to completely ignore a
+	 * property when marshalling/unmarshalling.
+	 */
+	public const TAG_MARSHAL = "marshal";
+
+	/**
+	 * put iterates through $data and sets values in $obj of properties that match keys in $data. The
+	 * properties are only set if the types match with the current values of $obj.
+	 *
+	 * @param \object $obj
+	 * @param array   $data
+	 */
+	public function put(object $obj, array $data) : void{
+		foreach($data as $key => $value){
+			// Cast to strings in case the object is actually an array casted to an object with numeric keys.
+			$key = $this->scanFor($obj, (string) $key);
+			if($key === "-"){
+				continue;
+			}
+			if(!isset($obj->{(string) $key})){
+				$obj->{(string) $key} = null;
+			}
+			$this->handleProperty($obj, $key, $value);
+		}
+	}
+
+	/**
+	 * scanFor looks for a property with the given name and returns it if found. If not found, it scans through all
+	 * properties in the object provided and checks if the tag 'marshal' is equal to $propertyName.
+	 *
+	 * @param \object $obj
+	 * @param string  $propertyName
+	 *
+	 * @return string
+	 */
+	private function scanFor(object $obj, string $propertyName) : string{
+		$refl = new \ReflectionObject($obj);
+		do{
+			if($refl->hasProperty($propertyName)){
+				$tags = self::parseDocComment($refl->getProperty($propertyName)->getDocComment());
+				if(isset($tags[self::TAG_MARSHAL])){
+					if($tags[self::TAG_MARSHAL] !== $propertyName){
+						// The marshal tag is not equal to $propertyName, so this property expects the value of a
+						// different key.
+						break;
+					}
+				}
+				// No need to scan if we can find a property with the same name right away, and it has no additional
+				// marshaltag that tells us it wants a different key.
+				return $propertyName;
+			}
+		}while(false);
+
+		foreach($refl->getProperties() as $property){
+			if($property->getDocComment() === false){
+				// No marshal
+				continue;
+			}
+			$tags = self::parseDocComment($property->getDocComment());
+			if(isset($tags[self::TAG_MARSHAL])){
+				if($tags[self::TAG_MARSHAL] === $propertyName){
+					// The marshal tag is equal to $propertyName, so we return the name of the property that has this
+					// tag, which gets its value set later.
+					return $property->name;
+				}
+			}
+		}
+
+		return "-";
+	}
+
+	/**
+	 * parseDocComment parses the documentation from a property.
+	 *
+	 * @param string $docComment
+	 *
+	 * @return array
+	 */
+	public static function parseDocComment(string $docComment) : array{
+		preg_match_all('/(*ANYCRLF)^[\t ]*\* @([a-zA-Z]+)(?:[\t ]+(.+))?[\t ]*$/m', $docComment, $matches);
+
+		return array_combine($matches[1], $matches[2]);
+	}
+
+	/**
+	 * handleProperty handles a property in $obj with index $key. The value $value is the value the property should
+	 * obtain, if their types are compatible.
+	 *
+	 * @param \object $obj
+	 * @param string  $key
+	 * @param mixed   $value
+	 */
+	private function handleProperty(object $obj, string $key, $value) : void{
+		if(is_object($obj->{$key})){
+			if(!is_array($value)){
+				// The property value was an object, but we didn't have an array as config value. We can't unmarshal
+				// this at all, so just continue.
+				return;
+			}
+			// Recursively iterate through the objects.
+			$this->put($obj->{$key}, $value);
+
+			return;
+		}elseif(is_array($obj->{$key})){
+			// We temporarily cast this array to an stdClass so we can use the put method for it.
+			$v = (object) $obj->{$key};
+			$this->put($v, $value);
+			// Cast it back to an array to the types remain consistent.
+			$obj->{$key} = (array) $v;
+
+			return;
+		}
+
+		// Only set the value if the current value either matches the one in the configuration, or if the current
+		// value is null.
+		if(gettype($obj->{$key}) === gettype($value) || $obj->{$key} === null){
+			$obj->{$key} = $value;
+		}
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace Sandertv\Marshal;
+
+/**
+ * Class DecodeException is thrown when Unmarshal could not successfully decode the data passed to it.
+ */
+class DecodeException extends \Exception{
+}<?php
+
+declare(strict_types=1);
+
+namespace Sandertv\Marshal;
+
+/**
+ * Class FileNotFoundException is thrown when Unmarshal could not find the file passed in *File functions.
+ */
+class FileNotFoundException extends \Exception{
+}<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\data;
+
+use BlockHorizons\BlockSniper\Loader;
+
+class TranslationData{
+
+	/** @var array */
+	private $messages = [];
+	/** @var Loader */
+	private $loader = null;
+
+	public function __construct(Loader $loader){
+		$this->loader = $loader;
+
+		$this->collectTranslations();
+		new Translation($this);
+	}
+
+	/**
+	 * @return bool
+	 */
+	public function collectTranslations() : bool{
+		$languageSelected = false;
+		$language = "";
+		foreach(Loader::getAvailableLanguages() as $availableLanguage){
+			if($this->loader->config->messageLanguage === $availableLanguage){
+				$this->loader->saveResource("languages/" . $availableLanguage . ".json");
+				$language = file_get_contents($this->loader->getDataFolder() . "languages/" . $availableLanguage . ".json");
+				$languageSelected = true;
+				break;
+			}
+		}
+		if(!$languageSelected){
+			$this->loader->saveResource("languages/en.json");
+			$language = file_get_contents($this->loader->getDataFolder() . "languages/en.json");
+		}
+		$this->messages = json_decode($language, true);
+
+		return $languageSelected;
+	}
+
+	/**
+	 * @return Loader
+	 */
+	public function getLoader() : Loader{
+		return $this->loader;
+	}
+
+	/**
+	 * @return array
+	 */
+	public function getMessages() : array{
+		return $this->messages;
+	}
+}{
+	"commands": {
+		"common": {
+			"warning-prefix": "[Warning] ",
+			"invalid-sender": "You can only execute this command as a player.",
+			"no-permission": "You do not have permission to execute this command."
+		},
+		"brush": {
+			"description": "Opens the GUI for BlockSniper."
+		},
+		"blocksniper": {
+			"description": "Displays information about BlockSniper, or reloads the plugin.",
+			"info": "Information",
+			"version": "Version: ",
+			"organisation": "Organisation: ",
+			"authors": "Authors: ",
+			"target-api": "Target API: ",
+			"reload": "Reloading BlockSniper..."
+		},
+		"redo": {
+			"description": "Redoes the last undone BlockSniper modification.",
+			"no-redo": "No modifications could be found to redo.",
+			"success": "Successfully redid the last undone modification."
+		},
+		"undo": {
+			"description": "Undoes the last BlockSniper modification.",
+			"no-undo": "No modifications could be found to undo.",
+			"success": "Successfully undid the last modification."
+		},
+		"clone": {
+			"description": "Clones an area using the specified format.",
+			"copy": {
+				"success": "Successfully copied the location looked at."
+			},
+			"template": {
+				"missing-name": "No valid name has been given for the template.",
+				"success": "Successfully saved a template file to %s."
+			},
+			"schematic": {
+				"missing-name": "No valid name has been given for the schematic.",
+				"success": "Successfully saved a schematic file to %s."
+			}
+		},
+		"paste": {
+			"description": "Pastes a previously cloned area to the world.",
+			"copy": {
+				"no-copies": "No copy could be found to paste.",
+				"success": "Successfully pasted the copy on the location looked at."
+			},
+			"template": {
+				"nonexistent": "The template %s could not be found in the template directory.",
+				"success": "Successfully pasted the template %s on the location looked at."
+			},
+			"schematic": {
+				"nonexistent": "The schematic %s could not be found in the schematic directory.",
+				"success": "Successfully pasted the schematic %s on the location looked at."
+			}
+		}
+	},
+	"ui": {
+		"preset-menu": {
+			"title": "Preset Menu",
+			"subtitle": "Click a button to continue",
+			"create": "Create",
+			"delete": "Delete",
+			"select": "Select",
+			"list": "List",
+			"exit": "Exit"
+		},
+		"preset-edit": {
+			"title": "Preset Edit Menu",
+			"name": "Preset Name",
+			"size": "Brush Size",
+			"shape": "Brush Shape",
+			"type": "Brush Type",
+			"hollow": "Hollow Brush",
+			"decrement": "Decrementing Brush",
+			"height": "Brush Height",
+			"perfect": "Brush Shape Perfection",
+			"blocks": "Brush Blocks",
+			"obsolete": "Obsolete Blocks",
+			"biome": "Brush Biome",
+			"tree": "Brush Tree"
+		},
+		"preset-selection": {
+			"title": "Preset Selection Menu",
+			"subtitle": "Click a button to apply the preset"
+		},
+		"preset-deletion": {
+			"title": "Preset Deletion Menu",
+			"subtitle": "Click a button to delete a preset"
+		},
+		"preset-list": {
+			"title": "Preset List Menu",
+			"subtitle": "Click a button to edit/view a preset"
+		},
+		"preset-creation": {
+			"title": "Preset Creation Menu",
+			"name": "Preset Name",
+			"size": "Brush Size",
+			"shape": "Brush Shape",
+			"type": "Brush Type",
+			"hollow": "Hollow Brush",
+			"decrement": "Decrementing Brush",
+			"height": "Brush Height",
+			"perfect": "Brush Shape Perfection",
+			"blocks": "Brush Blocks",
+			"obsolete": "Obsolete Blocks",
+			"biome": "Brush Biome",
+			"tree": "Brush Tree"
+		},
+		"main-menu": {
+			"title": "BlockSniper Menu",
+			"subtitle": "Click a button to continue",
+			"brush": "Brush",
+			"tree": "Tree",
+			"config": "Configuration",
+			"presets": "Presets",
+			"global-brush": "Global Brush",
+			"exit": "Exit"
+		},
+		"brush-menu": {
+			"title": "Brush Menu",
+			"size": "Brush Size",
+			"shape": "Brush Shape",
+			"type": "Brush Type",
+			"mode": {
+				"description": "Brush Mode",
+				"brush": "Brush",
+				"selection": "Selection"
+			},
+			"hollow": "Hollow Brush",
+			"decrement": "Decrementing Brush",
+			"height": "Brush Height",
+			"perfect": "Brush Shape Perfection",
+			"blocks": "Brush Blocks",
+			"obsolete": "Obsolete Blocks",
+			"biome": "Brush Biome",
+			"tree": "Brush Tree"
+		},
+		"configuration-menu": {
+			"title": "BlockSniper Configuration",
+			"auto-update": "Automatically update the configuration file when a new version is found",
+			"language": "Language used for sending BlockSniper related messages",
+			"brush-item": "Item ID of the item that is used to brush",
+			"selection-item": "Item ID of the item that is used to select",
+			"max-brush-size": "The absolute maximum size of brush",
+			"min-async-size": "Asynchronous brush size limit. If brush size is bigger than this, operations get executed asynchronously",
+			"max-reverts": "Maximum amount of Undo/Redo stores to save. Older ones get cleaned automatically",
+			"reset-decrement-brush": "Automatically reset decrementing brush to the initial starting size",
+			"save-brush": "Save brush properties of players on server restart",
+			"drop-plants": "Drop plant items destroyed/blown away by the LeafBlower type",
+			"session-timeout-time": "The time in minutes after which the session of a player is removed after leaving the server",
+			"auto-gui": "Automatically open the GUI when switching hotbar slot to one containing the brush item",
+			"myplot-support": "Whether to turn on MyPlot support or not",
+			"auto-reload": "Turning this toggle will automatically reload the configuration when closing this window"
+		},
+		"tree-menu": {
+			"title": "Tree Menu",
+			"trunk-height": "The height of the trunk of the tree",
+			"trunk-width": "The width of the tree at the bottom; The width decreases gradually upwards",
+			"max-branch-length": "The maximum length one of the branches of the tree can extend",
+			"trunk-blocks": "The blocks to use for the trunk of the tree",
+			"leaves-blocks": "The blocks to use for the leaves of the tree",
+			"leaves-cluster-size": "The size of the leaves cluster at the end of each branch"
+		}
+	},
+	"log": {
+		"language": {
+			"auto-selected": "[BlockSniper] No valid language has been selected. English has been auto selected.",
+			"usage": "Please select a language by going to the configuration tab in-game, using /b.",
+			"selected": "[BlockSniper] Language selected: "
+		},
+		"brush": {
+			"restored": "Brush of player %s has been restored.",
+			"all-restored": "All brushes have been restored."
+		},
+		"presets": {
+			"loaded": "Preset %s has been loaded.",
+			"all-loaded": "All presets have been loaded."
+		},
+		"reload": {
+			"start": "[BlockSniper] Reloading...",
+			"finish": "[BlockSniper] Reload finished."
+		}
+	},
+	"brush": {
+		"selection": {
+			"first": "Position 1 set to:",
+			"second": "Position 2 set to:",
+			"error": "Set your selection using the selection item before doing this action."
+		},
+		"shape": {
+			"cube": "Cube",
+			"cuboid": "Cuboid",
+			"sphere": "Sphere",
+			"cylinder": "Cylinder"
+		},
+		"type": {
+			"biome": "Biome",
+			"cleanentities": "Clean Entities",
+			"clean": "Clean",
+			"drain": "Drain",
+			"expand": "Expand",
+			"fill": "Fill",
+			"flattenall": "Flatten All",
+			"flatten": "Flatten",
+			"layer": "Layer",
+			"leafblower": "Leaf Blower",
+			"melt": "Melt",
+			"overlay": "Overlay",
+			"replaceall": "Replace All",
+			"replace": "Replace",
+			"snowcone": "Snowcone",
+			"toplayer": "Top Layer",
+			"tree": "Tree",
+			"regenerate": "Regenerate",
+			"freeze": "Freeze",
+			"warm": "Warm",
+			"heat": "Heat"
+		}
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\data;
+
+class Translation{
+
+	/**
+	 * These constants are AUTOMATICALLY GENERATED.
+	 *
+	 * Do NOT edit by hand.
+	 */
+	const COMMANDS_COMMON_WARNING_PREFIX = "commands.common.warning-prefix";
+	const COMMANDS_COMMON_INVALID_SENDER = "commands.common.invalid-sender";
+	const COMMANDS_COMMON_NO_PERMISSION = "commands.common.no-permission";
+	const COMMANDS_BRUSH_DESCRIPTION = "commands.brush.description";
+	const COMMANDS_BLOCKSNIPER_DESCRIPTION = "commands.blocksniper.description";
+	const COMMANDS_BLOCKSNIPER_INFO = "commands.blocksniper.info";
+	const COMMANDS_BLOCKSNIPER_VERSION = "commands.blocksniper.version";
+	const COMMANDS_BLOCKSNIPER_ORGANISATION = "commands.blocksniper.organisation";
+	const COMMANDS_BLOCKSNIPER_AUTHORS = "commands.blocksniper.authors";
+	const COMMANDS_BLOCKSNIPER_TARGET_API = "commands.blocksniper.target-api";
+	const COMMANDS_BLOCKSNIPER_RELOAD = "commands.blocksniper.reload";
+	const COMMANDS_REDO_DESCRIPTION = "commands.redo.description";
+	const COMMANDS_REDO_NO_REDO = "commands.redo.no-redo";
+	const COMMANDS_REDO_SUCCESS = "commands.redo.success";
+	const COMMANDS_UNDO_DESCRIPTION = "commands.undo.description";
+	const COMMANDS_UNDO_NO_UNDO = "commands.undo.no-undo";
+	const COMMANDS_UNDO_SUCCESS = "commands.undo.success";
+	const COMMANDS_CLONE_DESCRIPTION = "commands.clone.description";
+	const COMMANDS_CLONE_COPY_SUCCESS = "commands.clone.copy.success";
+	const COMMANDS_CLONE_TEMPLATE_MISSING_NAME = "commands.clone.template.missing-name";
+	const COMMANDS_CLONE_TEMPLATE_SUCCESS = "commands.clone.template.success";
+	const COMMANDS_CLONE_SCHEMATIC_MISSING_NAME = "commands.clone.schematic.missing-name";
+	const COMMANDS_CLONE_SCHEMATIC_SUCCESS = "commands.clone.schematic.success";
+	const COMMANDS_PASTE_DESCRIPTION = "commands.paste.description";
+	const COMMANDS_PASTE_COPY_NO_COPIES = "commands.paste.copy.no-copies";
+	const COMMANDS_PASTE_COPY_SUCCESS = "commands.paste.copy.success";
+	const COMMANDS_PASTE_TEMPLATE_NONEXISTENT = "commands.paste.template.nonexistent";
+	const COMMANDS_PASTE_TEMPLATE_SUCCESS = "commands.paste.template.success";
+	const COMMANDS_PASTE_SCHEMATIC_NONEXISTENT = "commands.paste.schematic.nonexistent";
+	const COMMANDS_PASTE_SCHEMATIC_SUCCESS = "commands.paste.schematic.success";
+	const UI_PRESET_MENU_TITLE = "ui.preset-menu.title";
+	const UI_PRESET_MENU_SUBTITLE = "ui.preset-menu.subtitle";
+	const UI_PRESET_MENU_CREATE = "ui.preset-menu.create";
+	const UI_PRESET_MENU_DELETE = "ui.preset-menu.delete";
+	const UI_PRESET_MENU_SELECT = "ui.preset-menu.select";
+	const UI_PRESET_MENU_LIST = "ui.preset-menu.list";
+	const UI_PRESET_MENU_EXIT = "ui.preset-menu.exit";
+	const UI_PRESET_EDIT_TITLE = "ui.preset-edit.title";
+	const UI_PRESET_EDIT_NAME = "ui.preset-edit.name";
+	const UI_PRESET_EDIT_SIZE = "ui.preset-edit.size";
+	const UI_PRESET_EDIT_SHAPE = "ui.preset-edit.shape";
+	const UI_PRESET_EDIT_TYPE = "ui.preset-edit.type";
+	const UI_PRESET_EDIT_HOLLOW = "ui.preset-edit.hollow";
+	const UI_PRESET_EDIT_DECREMENT = "ui.preset-edit.decrement";
+	const UI_PRESET_EDIT_HEIGHT = "ui.preset-edit.height";
+	const UI_PRESET_EDIT_PERFECT = "ui.preset-edit.perfect";
+	const UI_PRESET_EDIT_BLOCKS = "ui.preset-edit.blocks";
+	const UI_PRESET_EDIT_OBSOLETE = "ui.preset-edit.obsolete";
+	const UI_PRESET_EDIT_BIOME = "ui.preset-edit.biome";
+	const UI_PRESET_EDIT_TREE = "ui.preset-edit.tree";
+	const UI_PRESET_SELECTION_TITLE = "ui.preset-selection.title";
+	const UI_PRESET_SELECTION_SUBTITLE = "ui.preset-selection.subtitle";
+	const UI_PRESET_DELETION_TITLE = "ui.preset-deletion.title";
+	const UI_PRESET_DELETION_SUBTITLE = "ui.preset-deletion.subtitle";
+	const UI_PRESET_LIST_TITLE = "ui.preset-list.title";
+	const UI_PRESET_LIST_SUBTITLE = "ui.preset-list.subtitle";
+	const UI_PRESET_CREATION_TITLE = "ui.preset-creation.title";
+	const UI_PRESET_CREATION_NAME = "ui.preset-creation.name";
+	const UI_PRESET_CREATION_SIZE = "ui.preset-creation.size";
+	const UI_PRESET_CREATION_SHAPE = "ui.preset-creation.shape";
+	const UI_PRESET_CREATION_TYPE = "ui.preset-creation.type";
+	const UI_PRESET_CREATION_HOLLOW = "ui.preset-creation.hollow";
+	const UI_PRESET_CREATION_DECREMENT = "ui.preset-creation.decrement";
+	const UI_PRESET_CREATION_HEIGHT = "ui.preset-creation.height";
+	const UI_PRESET_CREATION_PERFECT = "ui.preset-creation.perfect";
+	const UI_PRESET_CREATION_BLOCKS = "ui.preset-creation.blocks";
+	const UI_PRESET_CREATION_OBSOLETE = "ui.preset-creation.obsolete";
+	const UI_PRESET_CREATION_BIOME = "ui.preset-creation.biome";
+	const UI_PRESET_CREATION_TREE = "ui.preset-creation.tree";
+	const UI_MAIN_MENU_TITLE = "ui.main-menu.title";
+	const UI_MAIN_MENU_SUBTITLE = "ui.main-menu.subtitle";
+	const UI_MAIN_MENU_BRUSH = "ui.main-menu.brush";
+	const UI_MAIN_MENU_TREE = "ui.main-menu.tree";
+	const UI_MAIN_MENU_CONFIG = "ui.main-menu.config";
+	const UI_MAIN_MENU_PRESETS = "ui.main-menu.presets";
+	const UI_MAIN_MENU_GLOBAL_BRUSH = "ui.main-menu.global-brush";
+	const UI_MAIN_MENU_EXIT = "ui.main-menu.exit";
+	const UI_BRUSH_MENU_TITLE = "ui.brush-menu.title";
+	const UI_BRUSH_MENU_SIZE = "ui.brush-menu.size";
+	const UI_BRUSH_MENU_SHAPE = "ui.brush-menu.shape";
+	const UI_BRUSH_MENU_TYPE = "ui.brush-menu.type";
+	const UI_BRUSH_MENU_MODE_DESCRIPTION = "ui.brush-menu.mode.description";
+	const UI_BRUSH_MENU_MODE_BRUSH = "ui.brush-menu.mode.brush";
+	const UI_BRUSH_MENU_MODE_SELECTION = "ui.brush-menu.mode.selection";
+	const UI_BRUSH_MENU_HOLLOW = "ui.brush-menu.hollow";
+	const UI_BRUSH_MENU_DECREMENT = "ui.brush-menu.decrement";
+	const UI_BRUSH_MENU_HEIGHT = "ui.brush-menu.height";
+	const UI_BRUSH_MENU_PERFECT = "ui.brush-menu.perfect";
+	const UI_BRUSH_MENU_BLOCKS = "ui.brush-menu.blocks";
+	const UI_BRUSH_MENU_OBSOLETE = "ui.brush-menu.obsolete";
+	const UI_BRUSH_MENU_BIOME = "ui.brush-menu.biome";
+	const UI_BRUSH_MENU_TREE = "ui.brush-menu.tree";
+	const UI_CONFIGURATION_MENU_TITLE = "ui.configuration-menu.title";
+	const UI_CONFIGURATION_MENU_AUTO_UPDATE = "ui.configuration-menu.auto-update";
+	const UI_CONFIGURATION_MENU_LANGUAGE = "ui.configuration-menu.language";
+	const UI_CONFIGURATION_MENU_BRUSH_ITEM = "ui.configuration-menu.brush-item";
+	const UI_CONFIGURATION_MENU_SELECTION_ITEM = "ui.configuration-menu.selection-item";
+	const UI_CONFIGURATION_MENU_MAX_BRUSH_SIZE = "ui.configuration-menu.max-brush-size";
+	const UI_CONFIGURATION_MENU_MIN_ASYNC_SIZE = "ui.configuration-menu.min-async-size";
+	const UI_CONFIGURATION_MENU_MAX_REVERTS = "ui.configuration-menu.max-reverts";
+	const UI_CONFIGURATION_MENU_RESET_DECREMENT_BRUSH = "ui.configuration-menu.reset-decrement-brush";
+	const UI_CONFIGURATION_MENU_SAVE_BRUSH = "ui.configuration-menu.save-brush";
+	const UI_CONFIGURATION_MENU_DROP_PLANTS = "ui.configuration-menu.drop-plants";
+	const UI_CONFIGURATION_MENU_SESSION_TIMEOUT_TIME = "ui.configuration-menu.session-timeout-time";
+	const UI_CONFIGURATION_MENU_AUTO_GUI = "ui.configuration-menu.auto-gui";
+	const UI_CONFIGURATION_MENU_MYPLOT_SUPPORT = "ui.configuration-menu.myplot-support";
+	const UI_CONFIGURATION_MENU_AUTO_RELOAD = "ui.configuration-menu.auto-reload";
+	const UI_TREE_MENU_TITLE = "ui.tree-menu.title";
+	const UI_TREE_MENU_TRUNK_HEIGHT = "ui.tree-menu.trunk-height";
+	const UI_TREE_MENU_TRUNK_WIDTH = "ui.tree-menu.trunk-width";
+	const UI_TREE_MENU_MAX_BRANCH_LENGTH = "ui.tree-menu.max-branch-length";
+	const UI_TREE_MENU_TRUNK_BLOCKS = "ui.tree-menu.trunk-blocks";
+	const UI_TREE_MENU_LEAVES_BLOCKS = "ui.tree-menu.leaves-blocks";
+	const UI_TREE_MENU_LEAVES_CLUSTER_SIZE = "ui.tree-menu.leaves-cluster-size";
+	const LOG_LANGUAGE_AUTO_SELECTED = "log.language.auto-selected";
+	const LOG_LANGUAGE_USAGE = "log.language.usage";
+	const LOG_LANGUAGE_SELECTED = "log.language.selected";
+	const LOG_BRUSH_RESTORED = "log.brush.restored";
+	const LOG_BRUSH_ALL_RESTORED = "log.brush.all-restored";
+	const LOG_PRESETS_LOADED = "log.presets.loaded";
+	const LOG_PRESETS_ALL_LOADED = "log.presets.all-loaded";
+	const LOG_RELOAD_START = "log.reload.start";
+	const LOG_RELOAD_FINISH = "log.reload.finish";
+	const BRUSH_SELECTION_FIRST = "brush.selection.first";
+	const BRUSH_SELECTION_SECOND = "brush.selection.second";
+	const BRUSH_SELECTION_ERROR = "brush.selection.error";
+	const BRUSH_SHAPE_CUBE = "brush.shape.cube";
+	const BRUSH_SHAPE_CUBOID = "brush.shape.cuboid";
+	const BRUSH_SHAPE_SPHERE = "brush.shape.sphere";
+	const BRUSH_SHAPE_CYLINDER = "brush.shape.cylinder";
+	const BRUSH_TYPE_BIOME = "brush.type.biome";
+	const BRUSH_TYPE_CLEANENTITIES = "brush.type.cleanentities";
+	const BRUSH_TYPE_CLEAN = "brush.type.clean";
+	const BRUSH_TYPE_DRAIN = "brush.type.drain";
+	const BRUSH_TYPE_EXPAND = "brush.type.expand";
+	const BRUSH_TYPE_FILL = "brush.type.fill";
+	const BRUSH_TYPE_FLATTENALL = "brush.type.flattenall";
+	const BRUSH_TYPE_FLATTEN = "brush.type.flatten";
+	const BRUSH_TYPE_LAYER = "brush.type.layer";
+	const BRUSH_TYPE_LEAFBLOWER = "brush.type.leafblower";
+	const BRUSH_TYPE_MELT = "brush.type.melt";
+	const BRUSH_TYPE_OVERLAY = "brush.type.overlay";
+	const BRUSH_TYPE_REPLACEALL = "brush.type.replaceall";
+	const BRUSH_TYPE_REPLACE = "brush.type.replace";
+	const BRUSH_TYPE_SNOWCONE = "brush.type.snowcone";
+	const BRUSH_TYPE_TOPLAYER = "brush.type.toplayer";
+	const BRUSH_TYPE_TREE = "brush.type.tree";
+
+	/** @var string[] */
+	private static $translations = [];
+	/** @var array */
+	private $messageData = [];
+
+	public function __construct(TranslationData $data){
+		$this->messageData = $data->getMessages();
+		$reflection = new \ReflectionClass(self::class);
+		foreach($reflection->getConstants() as $constant => $value){
+			if(($msg = $this->putMessage($value)) !== null){
+				self::$translations[$value] = $msg;
+			}
+		}
+	}
+
+	/**
+	 * @param string $key
+	 *
+	 * @return string
+	 */
+	private function putMessage(string $key) : ?string{
+		$messages = $this->messageData;
+		$path = explode(".", $key);
+		$pathCount = count($path);
+
+		$message = $messages[$path[0]];
+		for($i = 1; $i < $pathCount; $i++){
+			if(is_array($message)){
+				if(!isset($message[$path[$i]])){
+					return null;
+				}
+				$message = $message[$path[$i]];
+			}
+		}
+
+		return $message;
+	}
+
+	/**
+	 * @param string $key
+	 * @param array  $params
+	 *
+	 * @return string
+	 */
+	public static function get(string $key, array $params = []) : string{
+		if(!isset(self::$translations[$key])){
+			return "Unknown message: Please remove your language file and let it regenerate";
+		}
+		if(!empty($params)){
+			return vsprintf(self::$translations[$key], $params);
+		}
+
+		return self::$translations[$key];
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\presets;
+
+use BlockHorizons\BlockSniper\data\Translation;
+use BlockHorizons\BlockSniper\Loader;
+use Sandertv\Marshal\DecodeException;
+use Sandertv\Marshal\FileNotFoundException;
+use Sandertv\Marshal\Marshal;
+use Sandertv\Marshal\Unmarshal;
+
+class PresetManager{
+
+	/** @var Loader */
+	private $loader = null;
+	/** @var Preset[] */
+	private $presets = [];
+
+	public function __construct(Loader $loader){
+		$this->loader = $loader;
+
+		foreach(scandir($loader->getDataFolder() . "presets") as $fileName){
+			if($fileName === "." || $fileName === ".."){
+				continue;
+			}
+			if(!is_file($loader->getDataFolder() . "presets/" . $fileName)){
+				continue;
+			}
+			$preset = new Preset("");
+			try{
+				Unmarshal::jsonFile($loader->getDataFolder() . "presets/" . $fileName, $preset);
+			}catch(DecodeException $exception){
+				$loader->getLogger()->logException($exception);
+			}catch(FileNotFoundException $exception){
+				$loader->getLogger()->logException($exception);
+			}
+			$this->presets[] = $preset;
+			$loader->getLogger()->debug(Translation::get(Translation::LOG_PRESETS_LOADED, [$preset->name]) . " (" . json_encode($preset) . ")");
+		}
+		$loader->getLogger()->debug(Translation::get(Translation::LOG_PRESETS_ALL_LOADED));
+	}
+
+	/**
+	 * @param Preset $preset
+	 */
+	public function addPreset(Preset $preset) : void{
+		$this->presets[] = $preset;
+	}
+
+	/**
+	 * @param string $name
+	 *
+	 * @return bool
+	 */
+	public function isPreset(string $name) : bool{
+		foreach($this->presets as $preset){
+			if($name === $preset->name){
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * @param int $index
+	 *
+	 * @return Preset
+	 */
+	public function getPreset(int $index) : Preset{
+		return $this->presets[$index];
+	}
+
+	/**
+	 * @param int $offset
+	 */
+	public function deletePreset(int $offset) : void{
+		unset($this->presets[$offset]);
+	}
+
+	public function storePresetsToFile() : void{
+		foreach($this->presets as $index => $preset){
+			Marshal::jsonFile($this->loader->getDataFolder() . "presets/" . $preset->name . ".json", $preset);
+		}
+	}
+
+	/**
+	 * @return Loader
+	 */
+	public function getLoader() : Loader{
+		return $this->loader;
+	}
+
+	/**
+	 * @return Preset[]
+	 */
+	public function getAllPresets() : array{
+		return $this->presets;
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\registration;
+
+use BlockHorizons\BlockSniper\brush\shapes\CubeShape;
+use BlockHorizons\BlockSniper\brush\shapes\CuboidShape;
+use BlockHorizons\BlockSniper\brush\shapes\CylinderShape;
+use BlockHorizons\BlockSniper\brush\shapes\SphereShape;
+use BlockHorizons\BlockSniper\exceptions\InvalidIdException;
+use pocketmine\permission\Permission;
+use pocketmine\permission\PermissionManager;
+
+class ShapeRegistration{
+
+	/** @var string[] */
+	private static $shapes = [];
+	/** @var string[] */
+	private static $shapesIds = [];
+
+	public static function init() : void{
+		self::registerShape(SphereShape::class, SphereShape::ID);
+		self::registerShape(CubeShape::class, CubeShape::ID);
+		self::registerShape(CuboidShape::class, CuboidShape::ID);
+		self::registerShape(CylinderShape::class, CylinderShape::ID);
+	}
+
+	/**
+	 * Registers a new shape with the given Class::class as parameter.
+	 * Use $overwrite = true if you'd like to overwrite an existing shape.
+	 *
+	 * @param string $class
+	 * @param int    $id
+	 * @param bool   $overwrite
+	 *
+	 * @return bool
+	 */
+	public static function registerShape(string $class, int $id, bool $overwrite = false) : bool{
+		$shortName = str_replace("Shape", "", (new \ReflectionClass($class))->getShortName());
+
+		if(!$overwrite && self::shapeExists(strtolower($shortName), $id)){
+			return false;
+		}
+		if($id < 0){
+			throw new InvalidIdException("A shape ID should be positive.");
+		}
+		self::$shapesIds[$id] = $shortName;
+		self::$shapes[strtolower($shortName)] = $class;
+		self::registerPermission(strtolower($shortName));
+
+		return true;
+	}
+
+	/**
+	 * Returns whether a shape with the given name exists or not.
+	 *
+	 * @param string $shapeName
+	 * @param int    $id
+	 *
+	 * @return bool
+	 */
+	public static function shapeExists(string $shapeName, int $id = -1) : bool{
+		return isset(self::$shapes[$shapeName]) || isset(self::$shapesIds[$id]);
+	}
+
+	/**
+	 * @param string $shapeName
+	 */
+	private static function registerPermission(string $shapeName) : void{
+		$permission = new Permission("blocksniper.shape." . $shapeName, "Allows permission to use the " . $shapeName . " shape.", Permission::DEFAULT_OP);
+		$permission->addParent("blocksniper.shape", true);
+		PermissionManager::getInstance()->addPermission($permission);
+	}
+
+	/**
+	 * Returns an array containing the class string of all shapes.
+	 *
+	 * @return string[]
+	 */
+	public static function getShapes() : array{
+		return self::$shapes;
+	}
+
+	/**
+	 * Returns an array containing the ID => Name of all shapes.
+	 *
+	 * @return string[]
+	 */
+	public static function getShapeIds() : array{
+		return self::$shapesIds;
+	}
+
+	/**
+	 * Returns a shape class name by ID.
+	 *
+	 * @param int  $id
+	 * @param bool $name
+	 *
+	 * @return null|string
+	 */
+	public static function getShapeById(int $id, bool $name = false) : ?string{
+		if(!isset(self::$shapesIds[$id])){
+			return null;
+		}
+
+		return $name ? self::$shapesIds[$id] : self::getShape(strtolower(self::$shapesIds[$id]));
+	}
+
+	/**
+	 * Returns the class string of the requested shape.
+	 *
+	 * @param string $shortName
+	 *
+	 * @return null|string
+	 */
+	public static function getShape(string $shortName) : ?string{
+		return self::$shapes[strtolower($shortName)] ?? null;
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\shapes;
+
+use BlockHorizons\BlockSniper\brush\BaseShape;
+use BlockHorizons\BlockSniper\brush\Brush;
+use pocketmine\math\AxisAlignedBB;
+use pocketmine\math\Vector3;
+
+class SphereShape extends BaseShape{
+
+	const ID = self::SHAPE_SPHERE;
+
+	/**
+	 * @param bool $vectorOnly
+	 *
+	 * @return \Generator
+	 */
+	public function getBlocksInside(bool $vectorOnly = false) : \Generator{
+		$radiusX = ($this->maxX - $this->minX) / 2;
+		$radiusY = ($this->maxY - $this->minY) / 2;
+		$radiusZ = ($this->maxZ - $this->minZ) / 2;
+
+		$centerX = $this->minX + $radiusX;
+		$centerY = $this->minY + $radiusY;
+		$centerZ = $this->minZ + $radiusZ;
+
+		for($x = $this->maxX; $x >= $this->minX; $x--){
+			$xs = ($x - $centerX) ** 2 / $radiusX ** 2;
+			for($y = $this->maxY; $y >= $this->minY; $y--){
+				$ys = ($y - $centerY) ** 2 / $radiusY ** 2;
+				for($z = $this->maxZ; $z >= $this->minZ; $z--){
+					$zs = ($z - $centerZ) ** 2 / $radiusZ ** 2;
+					if($xs + $ys + $zs <= 1.0){
+						if($this->hollow){
+							if($xs + $ys + $zs < 0.85){
+								continue;
+							}
+						}
+						yield $vectorOnly ? new Vector3((int) $x, (int) $y, (int) $z) : $this->getLevel()->getBlock(new Vector3($x, $y, $z));
+					}
+				}
+			}
+		}
+	}
+
+	/**
+	 * @return int
+	 */
+	public function getBlockCount() : int {
+		$i = 0;
+		$radiusX = ($this->maxX - $this->minX) / 2;
+		$radiusY = ($this->maxY - $this->minY) / 2;
+		$radiusZ = ($this->maxZ - $this->minZ) / 2;
+
+		$centerX = $this->minX + $radiusX;
+		$centerY = $this->minY + $radiusY;
+		$centerZ = $this->minZ + $radiusZ;
+
+		for($x = $this->maxX; $x >= $this->minX; $x--){
+			$xs = ($x - $centerX) ** 2 / $radiusX ** 2;
+			for($y = $this->maxY; $y >= $this->minY; $y--){
+				$ys = ($y - $centerY) ** 2 / $radiusY ** 2;
+				for($z = $this->maxZ; $z >= $this->minZ; $z--){
+					$zs = ($z - $centerZ) ** 2 / $radiusZ ** 2;
+					if($xs + $ys + $zs <= 1.0){
+						if($this->hollow){
+							if($xs + $ys + $zs < 0.85){
+								continue;
+							}
+						}
+						++$i;
+					}
+				}
+			}
+		}
+		return $i;
+	}
+
+	/**
+	 * @return string
+	 */
+	public function getName() : string{
+		return $this->hollow ? "Hollow Sphere" : "Sphere";
+	}
+
+	/**
+	 * @param Vector3       $center
+	 * @param Brush         $brush
+	 * @param AxisAlignedBB $bb
+	 */
+	public function buildSelection(Vector3 $center, Brush $brush, AxisAlignedBB $bb) : void{
+		[$bb->maxX, $bb->maxY, $bb->maxZ, $bb->minX, $bb->minY, $bb->minZ] = [
+			$center->x + $brush->size, $center->y + $brush->size, $center->z + $brush->size,
+			$center->x - $brush->size, $center->y - $brush->size, $center->z - $brush->size
+		];
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush;
+
+use BlockHorizons\BlockSniper\brush\async\tasks\BrushTask;
+use BlockHorizons\BlockSniper\brush\registration\ShapeRegistration;
+use pocketmine\level\Level;
+use pocketmine\level\Position;
+use pocketmine\math\AxisAlignedBB;
+use pocketmine\math\Vector2;
+use pocketmine\math\Vector3;
+use pocketmine\Player;
+use pocketmine\Server;
+
+abstract class BaseShape extends AxisAlignedBB{
+
+	const ID = -1;
+
+	const SHAPE_SPHERE = 0;
+	const SHAPE_CUBE = 1;
+	const SHAPE_CUBOID = 2;
+	const SHAPE_CYLINDER = 3;
+
+	/** @var int */
+	protected $level = 0;
+	/** @var Vector3 */
+	protected $center;
+	/** @var bool */
+	protected $hollow = false;
+	/** @var string */
+	protected $playerName = "";
+
+	public function __construct(Player $player, Level $level, Position $center, ?AxisAlignedBB $bb, Brush $brush){
+		if($bb === null){
+			$bb = new AxisAlignedBB(0, 0, 0, 0, 0, 0);
+			$this->buildSelection($center, $brush, $bb);
+		}
+		parent::__construct($bb->minX, $bb->minY, $bb->minZ, $bb->maxX, $bb->maxY, $bb->maxZ);
+
+		$this->playerName = $player->getName();
+		$this->level = $level->getId();
+		$this->center = $center->asVector3();
+		$this->hollow = $brush->hollow;
+	}
+
+	/**
+	 * @param Server $server
+	 *
+	 * @return Player|null
+	 */
+	public function getPlayer(Server $server) : ?Player{
+		return $server->getPlayer($this->playerName);
+	}
+
+	/**
+	 * @return string
+	 */
+	public function getPlayerName() : string {
+		return $this->playerName;
+	}
+
+	/**
+	 * Returns true if the shape is hollow, false if it is not.
+	 *
+	 * @return bool
+	 */
+	public function isHollow() : bool{
+		return $this->hollow;
+	}
+
+	/**
+	 * Returns the permission required to use the shape.
+	 *
+	 * @return string
+	 */
+	public function getPermission() : string{
+		return "blocksniper.shape." . strtolower(ShapeRegistration::getShapeById(self::ID, true));
+	}
+
+	/**
+	 * @param BaseType    $type
+	 * @param Vector2[][] $plotPoints
+	 *
+	 * @return bool
+	 */
+	public function editAsynchronously(BaseType $type, array $plotPoints = []) : bool{
+		$this->getLevel()->getServer()->getAsyncPool()->submitTask(new BrushTask($this, $type, $this->getTouchedChunks(), $plotPoints));
+
+		return true;
+	}
+
+	/**
+	 * @return string[]
+	 */
+	public function getTouchedChunks() : array{
+		$touchedChunks = [];
+		for($x = $this->minX; $x <= $this->maxX + 16; $x += 16){
+			for($z = $this->minZ; $z <= $this->maxZ + 16; $z += 16){
+				$chunk = $this->getLevel()->getChunk($x >> 4, $z >> 4, true);
+				if($chunk === null){
+					continue;
+				}
+				$touchedChunks[Level::chunkHash($x >> 4, $z >> 4)] = $chunk->fastSerialize();
+			}
+		}
+
+		return $touchedChunks;
+	}
+
+	/**
+	 * Returns the level the shape is made in.
+	 *
+	 * @return Level
+	 */
+	public function getLevel() : Level{
+		return Server::getInstance()->getLevel($this->level);
+	}
+
+	/**
+	 * Returns the name of the shape.
+	 *
+	 * @return string
+	 */
+	public abstract function getName() : string;
+
+	/**
+	 * Returns all blocks in the shape if $partially is false. If true, only returns part of the shape, specified by $blocksPerTick.
+	 *
+	 * @param $vectorOnly
+	 *
+	 * @return \Generator
+	 */
+	public abstract function getBlocksInside(bool $vectorOnly = false) : \Generator;
+
+	/**
+	 * Builds a selection if the brush mode is Brush::MODE_BRUSH. $center is the target block, and $bb requires its
+	 * bounds to be set.
+	 *
+	 * @param Vector3       $center
+	 * @param Brush         $brush
+	 * @param AxisAlignedBB $bb
+	 */
+	public abstract function buildSelection(Vector3 $center, Brush $brush, AxisAlignedBB $bb) : void;
+
+	/**
+	 * Calculates the total amount of blocks in the selection of the shape.
+	 *
+	 * @return int
+	 */
+	public abstract function getBlockCount() : int;
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\shapes;
+
+use BlockHorizons\BlockSniper\brush\Brush;
+use pocketmine\math\AxisAlignedBB;
+use pocketmine\math\Vector3;
+
+class CubeShape extends CuboidShape{
+
+	const ID = self::SHAPE_CUBE;
+
+	/**
+	 * @return string
+	 */
+	public function getName() : string{
+		return $this->hollow ? "Hollow Cube" : "Cube";
+	}
+
+	/**
+	 * @param Vector3       $center
+	 * @param Brush         $brush
+	 * @param AxisAlignedBB $bb
+	 */
+	public function buildSelection(Vector3 $center, Brush $brush, AxisAlignedBB $bb) : void{
+		[$bb->maxX, $bb->maxY, $bb->maxZ, $bb->minX, $bb->minY, $bb->minZ] = [
+			$center->x + $brush->size, $center->y + $brush->size, $center->z + $brush->size,
+			$center->x - $brush->size, $center->y - $brush->size, $center->z - $brush->size
+		];
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\shapes;
+
+use BlockHorizons\BlockSniper\brush\BaseShape;
+use BlockHorizons\BlockSniper\brush\Brush;
+use pocketmine\math\AxisAlignedBB;
+use pocketmine\math\Vector3;
+
+class CuboidShape extends BaseShape{
+
+	const ID = self::SHAPE_CUBOID;
+
+	/**
+	 * @param bool $vectorOnly
+	 *
+	 * @return \Generator
+	 */
+	public function getBlocksInside(bool $vectorOnly = false) : \Generator{
+		for($x = $this->minX; $x <= $this->maxX; $x++){
+			for($y = $this->minY; $y <= $this->maxY; $y++){
+				for($z = $this->minZ; $z <= $this->maxZ; $z++){
+					if($this->hollow){
+						if($x !== $this->maxX && $x !== $this->minX && $y !== $this->maxY && $y !== $this->minY && $z !== $this->maxZ && $z !== $this->minZ){
+							continue;
+						}
+					}
+					yield $vectorOnly ? new Vector3((int) $x, (int) $y, (int) $z) : $this->getLevel()->getBlock(new Vector3($x, $y, $z));
+				}
+			}
+		}
+	}
+
+	/**
+	 * @return int
+	 */
+	public function getBlockCount() : int {
+		$i = 0;
+		for($x = $this->minX; $x <= $this->maxX; $x++){
+			for($y = $this->minY; $y <= $this->maxY; $y++){
+				for($z = $this->minZ; $z <= $this->maxZ; $z++){
+					if($this->hollow){
+						if($x !== $this->maxX && $x !== $this->minX && $y !== $this->maxY && $y !== $this->minY && $z !== $this->maxZ && $z !== $this->minZ){
+							continue;
+						}
+					}
+					++$i;
+				}
+			}
+		}
+		return $i;
+	}
+
+	/**
+	 * @return string
+	 */
+	public function getName() : string{
+		return $this->hollow ? "Hollow Cuboid" : "Cuboid";
+	}
+
+	/**
+	 * @param Vector3       $center
+	 * @param Brush         $brush
+	 * @param AxisAlignedBB $bb
+	 */
+	public function buildSelection(Vector3 $center, Brush $brush, AxisAlignedBB $bb) : void{
+		[$bb->maxX, $bb->maxY, $bb->maxZ, $bb->minX, $bb->minY, $bb->minZ] = [
+			$center->x + $brush->size, $center->y + $brush->height, $center->z + $brush->size,
+			$center->x - $brush->size, $center->y - $brush->height, $center->z - $brush->size
+		];
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\shapes;
+
+use BlockHorizons\BlockSniper\brush\BaseShape;
+use BlockHorizons\BlockSniper\brush\Brush;
+use pocketmine\math\AxisAlignedBB;
+use pocketmine\math\Vector3;
+
+class CylinderShape extends BaseShape{
+
+	const ID = self::SHAPE_CYLINDER;
+
+	/**
+	 * @param bool $vectorOnly
+	 *
+	 * @return \Generator
+	 */
+	public function getBlocksInside(bool $vectorOnly = false) : \Generator{
+		$radiusX = ($this->maxX - $this->minX) / 2;
+		$radiusZ = ($this->maxZ - $this->minZ) / 2;
+
+		$centerX = $this->minX + $radiusX;
+		$centerZ = $this->minZ + $radiusZ;
+
+		for($x = $this->minX; $x <= $this->maxX; $x++){
+			$xs = ($x - $centerX) ** 2 / $radiusX ** 2;
+			for($z = $this->minZ; $z <= $this->maxZ; $z++){
+				$zs = ($z - $centerZ) ** 2 / $radiusZ ** 2;
+				for($y = $this->minY; $y <= $this->maxY; $y++){
+					if($xs + $zs <= 1.0){
+						if($this->hollow){
+							if($xs + $zs < 0.85 && $y !== $this->minY && $y !== $this->maxY){
+								continue;
+							}
+						}
+						yield $vectorOnly ? new Vector3((int) $x, (int) $y, (int) $z) : $this->getLevel()->getBlock(new Vector3($x, $y, $z));
+					}
+				}
+			}
+		}
+	}
+
+	/**
+	 * @return int
+	 */
+	public function getBlockCount() : int {
+		$i = 0;
+		$radiusX = ($this->maxX - $this->minX) / 2;
+		$radiusZ = ($this->maxZ - $this->minZ) / 2;
+
+		$centerX = $this->minX + $radiusX;
+		$centerZ = $this->minZ + $radiusZ;
+
+		for($x = $this->minX; $x <= $this->maxX; $x++){
+			$xs = ($x - $centerX) ** 2 / $radiusX ** 2;
+			for($z = $this->minZ; $z <= $this->maxZ; $z++){
+				$zs = ($z - $centerZ) ** 2 / $radiusZ ** 2;
+				for($y = $this->minY; $y <= $this->maxY; $y++){
+					if($xs + $zs <= 1.0){
+						if($this->hollow){
+							if($xs + $zs < 0.85 && $y !== $this->minY && $y !== $this->maxY){
+								continue;
+							}
+						}
+						++$i;
+					}
+				}
+			}
+		}
+		return $i;
+	}
+
+	/**
+	 * @return string
+	 */
+	public function getName() : string{
+		return $this->hollow ? "Hollow Standing Cylinder" : "Standing Cylinder";
+	}
+
+	/**
+	 * @param Vector3       $center
+	 * @param Brush         $brush
+	 * @param AxisAlignedBB $bb
+	 */
+	public function buildSelection(Vector3 $center, Brush $brush, AxisAlignedBB $bb) : void{
+		[$bb->maxX, $bb->maxY, $bb->maxZ, $bb->minX, $bb->minY, $bb->minZ] = [
+			$center->x + $brush->size, $center->y + $brush->height, $center->z + $brush->size,
+			$center->x - $brush->size, $center->y - $brush->height, $center->z - $brush->size
+		];
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\registration;
+
+use BlockHorizons\BlockSniper\brush\types\BiomeType;
+use BlockHorizons\BlockSniper\brush\types\CleanEntitiesType;
+use BlockHorizons\BlockSniper\brush\types\CleanType;
+use BlockHorizons\BlockSniper\brush\types\DrainType;
+use BlockHorizons\BlockSniper\brush\types\ExpandType;
+use BlockHorizons\BlockSniper\brush\types\FillType;
+use BlockHorizons\BlockSniper\brush\types\FlattenAllType;
+use BlockHorizons\BlockSniper\brush\types\FlattenType;
+use BlockHorizons\BlockSniper\brush\types\FreezeType;
+use BlockHorizons\BlockSniper\brush\types\HeatType;
+use BlockHorizons\BlockSniper\brush\types\LayerType;
+use BlockHorizons\BlockSniper\brush\types\LeafBlowerType;
+use BlockHorizons\BlockSniper\brush\types\MeltType;
+use BlockHorizons\BlockSniper\brush\types\OverlayType;
+use BlockHorizons\BlockSniper\brush\types\RegenerateType;
+use BlockHorizons\BlockSniper\brush\types\ReplaceAllType;
+use BlockHorizons\BlockSniper\brush\types\ReplaceType;
+use BlockHorizons\BlockSniper\brush\types\SnowConeType;
+use BlockHorizons\BlockSniper\brush\types\TopLayerType;
+use BlockHorizons\BlockSniper\brush\types\TreeType;
+use BlockHorizons\BlockSniper\brush\types\WarmType;
+use BlockHorizons\BlockSniper\exceptions\InvalidIdException;
+use pocketmine\permission\Permission;
+use pocketmine\permission\PermissionManager;
+
+class TypeRegistration{
+
+	/** @var string[] */
+	private static $types = [];
+	/** @var string[] */
+	private static $typesIds = [];
+
+	public static function init() : void{
+		self::registerType(BiomeType::class, BiomeType::ID);
+		self::registerType(CleanEntitiesType::class, CleanEntitiesType::ID);
+		self::registerType(CleanType::class, CleanType::ID);
+		self::registerType(DrainType::class, DrainType::ID);
+		self::registerType(ExpandType::class, ExpandType::ID);
+		self::registerType(FillType::class, FillType::ID);
+		self::registerType(FlattenAllType::class, FlattenAllType::ID);
+		self::registerType(FlattenType::class, FlattenType::ID);
+		self::registerType(LayerType::class, LayerType::ID);
+		self::registerType(LeafBlowerType::class, LeafBlowerType::ID);
+		self::registerType(MeltType::class, MeltType::ID);
+		self::registerType(OverlayType::class, OverlayType::ID);
+		self::registerType(ReplaceAllType::class, ReplaceAllType::ID);
+		self::registerType(ReplaceType::class, ReplaceType::ID);
+		self::registerType(SnowConeType::class, SnowConeType::ID);
+		self::registerType(TopLayerType::class, TopLayerType::ID);
+		self::registerType(TreeType::class, TreeType::ID);
+		self::registerType(RegenerateType::class, RegenerateType::ID);
+		self::registerType(FreezeType::class, FreezeType::ID);
+		self::registerType(WarmType::class, WarmType::ID);
+		self::registerType(HeatType::class, HeatType::ID);
+	}
+
+	/**
+	 * Registers a new type with the given Class::class as parameter.
+	 * Use $overwrite = true if you'd like to overwrite an existing type.
+	 *
+	 * @param string $class
+	 * @param int    $id
+	 * @param bool   $overwrite
+	 *
+	 * @return bool
+	 */
+	public static function registerType(string $class, int $id, bool $overwrite = false) : bool{
+		$shortName = str_replace("Type", "", (new \ReflectionClass($class))->getShortName());
+
+		if(!$overwrite && self::typeExists(strtolower($shortName), $id)){
+			return false;
+		}
+		if($id < 0){
+			throw new InvalidIdException("A shape ID should be positive.");
+		}
+		self::$typesIds[$id] = $shortName;
+		self::$types[strtolower($shortName)] = $class;
+		self::registerPermission(strtolower($shortName));
+
+		return true;
+	}
+
+	/**
+	 * Returns whether a type with the given name exists or not.
+	 *
+	 * @param string $typeName
+	 * @param int    $id
+	 *
+	 * @return bool
+	 */
+	public static function typeExists(string $typeName, int $id = -1) : bool{
+		return isset(self::$types[$typeName]) || isset(self::$typesIds[$id]);
+	}
+
+	/**
+	 * @param string $typeName
+	 */
+	private static function registerPermission(string $typeName) : void{
+		$permission = new Permission("blocksniper.type." . $typeName, "Allows permission to use the " . $typeName . " shape.", Permission::DEFAULT_OP);
+		$permission->addParent("blocksniper.type", true);
+		PermissionManager::getInstance()->addPermission($permission);
+	}
+
+	/**
+	 * Returns an array containing the class string of all types.
+	 *
+	 * @return string[]
+	 */
+	public static function getTypes() : array{
+		return self::$types;
+	}
+
+	/**
+	 * Returns an array containing the ID => Name of all types.
+	 *
+	 * @return string[]
+	 */
+	public static function getTypeIds() : array{
+		return self::$typesIds;
+	}
+
+	/**
+	 * Returns a type class name by ID.
+	 *
+	 * @param int  $id
+	 * @param bool $name
+	 *
+	 * @return null|string
+	 */
+	public static function getTypeById(int $id, bool $name = false) : ?string{
+		if(!isset(self::$typesIds[$id])){
+			return null;
+		}
+
+		return $name ? self::$typesIds[$id] : self::getType(strtolower(self::$typesIds[$id]));
+	}
+
+	/**
+	 * Returns the class string of the requested type.
+	 *
+	 * @param string $shortName
+	 *
+	 * @return null|string
+	 */
+	public static function getType(string $shortName) : ?string{
+		return self::$types[$shortName] ?? null;
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use BlockHorizons\BlockSniper\sessions\SessionManager;
+use pocketmine\level\ChunkManager;
+use pocketmine\Player;
+
+/*
+ * Changes the biome within the brush radius.
+ */
+
+class BiomeType extends BaseType{
+
+	const ID = self::TYPE_BIOME;
+
+	public function __construct(Player $player, ChunkManager $level, \Generator $blocks){
+		parent::__construct($player, $level, $blocks);
+		$this->biome = SessionManager::getPlayerSession($player)->getBrush()->biomeId;
+	}
+
+	public function getName() : string{
+		return "Biome";
+	}
+
+	/**
+	 * Returns the biome of this type.
+	 *
+	 * @return int
+	 */
+	public function getBiome() : int{
+		return $this->biome;
+	}
+
+	/**
+	 * @return \Generator
+	 */
+	protected function fillSynchronously() : \Generator{
+		foreach($this->blocks as $block){
+			$this->putBiome($block, $this->biome);
+		}
+		if(false){
+			// Make PHP recognize this is a generator.
+			yield;
+		}
+	}
+
+	protected function fillAsynchronously() : void{
+		foreach($this->blocks as $block){
+			$this->putBiome($block, $this->biome);
+		}
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush;
+
+use BlockHorizons\BlockSniper\brush\async\BlockSniperChunkManager;
+use BlockHorizons\BlockSniper\brush\registration\TypeRegistration;
+use BlockHorizons\BlockSniper\sessions\SessionManager;
+use pocketmine\block\Block;
+use pocketmine\level\ChunkManager;
+use pocketmine\level\format\Chunk;
+use pocketmine\level\Level;
+use pocketmine\level\Position;
+use pocketmine\math\Vector2;
+use pocketmine\math\Vector3;
+use pocketmine\Player;
+use pocketmine\Server;
+
+abstract class BaseType{
+
+	const ID = -1;
+
+	const TYPE_BIOME = 0;
+	const TYPE_CLEAN_ENTITIES = 1;
+	const TYPE_CLEAN = 2;
+	const TYPE_DRAIN = 3;
+	const TYPE_EXPAND = 4;
+	const TYPE_FILL = 5;
+	const TYPE_FLATTEN_ALL = 6;
+	const TYPE_FLATTEN = 7;
+	const TYPE_LAYER = 8;
+	const TYPE_LEAF_BLOWER = 9;
+	const TYPE_MELT = 10;
+	const TYPE_OVERLAY = 11;
+	const TYPE_REPLACE_ALL = 12;
+	const TYPE_REPLACE = 13;
+	const TYPE_SNOW_CONE = 14;
+	const TYPE_TOP_LAYER = 15;
+	const TYPE_TREE = 16;
+	const TYPE_REGENERATE = 17;
+	const TYPE_FREEZE = 18;
+	const TYPE_WARM = 19;
+	const TYPE_HEAT = 20;
+
+	/** @var int */
+	protected $level = 0;
+	/** @var int */
+	protected $biome = 0;
+	/** @var \Generator */
+	protected $blocks = [];
+	/** @var Position|null */
+	protected $center = null;
+	/** @var Block[]|array */
+	protected $obsolete = [];
+	/** @var TreeProperties */
+	protected $tree = 0;
+	/** @var Block[] */
+	protected $brushBlocks = [];
+	/** @var int */
+	protected $height = 0;
+	/** @var null|BlockSniperChunkManager */
+	protected $chunkManager = null;
+	/** @var bool */
+	protected $myPlotChecked = false;
+	/** @var bool */
+	private $async = false;
+	/** @var Vector2[][] */
+	private $plotPoints = [];
+
+	/**
+	 * @param Player       $player
+	 * @param ChunkManager $manager
+	 * @param \Generator   $blocks
+	 */
+	public function __construct(Player $player, ChunkManager $manager, \Generator $blocks = null){
+		if($manager instanceof Level){
+			$this->level = $manager->getId();
+		}else{
+			$this->async = true;
+			$this->chunkManager = $manager;
+		}
+		$this->blocks = $blocks;
+		$this->brushBlocks = SessionManager::getPlayerSession($player)->getBrush()->getBlocks();
+	}
+
+	/**
+	 * @param Chunk[] $chunks
+	 *
+	 * @return BlockSniperChunkManager
+	 */
+	public static function establishChunkManager(array $chunks) : BlockSniperChunkManager{
+		$manager = new BlockSniperChunkManager(0);
+		foreach($chunks as $chunk){
+			$manager->setChunk($chunk->getX(), $chunk->getZ(), $chunk);
+		}
+
+		return $manager;
+	}
+
+	/**
+	 * @param Vector2[][] $plotPoints
+	 *
+	 * @return \Generator|null
+	 */
+	public final function fillShape(array $plotPoints = []) : ?\Generator{
+		$this->plotPoints = $plotPoints;
+		if(!empty($plotPoints)){
+			$this->myPlotChecked = true;
+		}
+		if($this->isAsynchronous() && $this->canBeExecutedAsynchronously()){
+			$this->fillAsynchronously();
+
+			return null;
+		}
+
+		return $this->fillSynchronously();
+	}
+
+	/**
+	 * @return bool
+	 */
+	public function isAsynchronous() : bool{
+		return $this->async;
+	}
+
+	/**
+	 * @return bool
+	 */
+	public function canBeExecutedAsynchronously() : bool{
+		return true;
+	}
+
+	protected function fillAsynchronously() : void{
+
+	}
+
+	/**
+	 * @return \Generator
+	 */
+	protected abstract function fillSynchronously() : \Generator;
+
+	/**
+	 * @return int
+	 */
+	public function getLevelId() : int{
+		return $this->level;
+	}
+
+	/**
+	 * @param \Generator|null $blocks
+	 *
+	 * @return BaseType
+	 */
+	public function setBlocksInside(?\Generator $blocks) : self{
+		$this->blocks = $blocks;
+
+		return $this;
+	}
+
+	/**
+	 * Returns the blocks the type is being executed upon.
+	 *
+	 * @return \Generator
+	 */
+	public function getBlocks() : \Generator{
+		return $this->blocks;
+	}
+
+	/**
+	 * @return array
+	 */
+	public function getBrushBlocks() : array{
+		return $this->brushBlocks;
+	}
+
+	/**
+	 * Returns the permission required to use the type.
+	 *
+	 * @return string
+	 */
+	public function getPermission() : string{
+		return "blocksniper.type." . strtolower(TypeRegistration::getTypeById(self::ID, true));
+	}
+
+	/**
+	 * @return string
+	 */
+	public abstract function getName() : string;
+
+	/**
+	 * @param bool $value
+	 *
+	 * @return BaseType
+	 */
+	public function setAsynchronous(bool $value = true) : self{
+		$this->async = $value;
+
+		return $this;
+	}
+
+	/**
+	 * Puts a block at the given location either asynchronously or synchronously with MyPlot checks (if relevant)
+	 *
+	 * @param Vector3 $pos
+	 * @param int     $id
+	 * @param int     $meta
+	 */
+	public function putBlock(Vector3 $pos, int $id, int $meta = 0) : void{
+		$valid = false;
+		if($this->myPlotChecked){
+			foreach($this->plotPoints as $plotCorners){
+				if($pos->x < $plotCorners[0]->x || $pos->z < $plotCorners[0]->y || $pos->x > $plotCorners[1]->x || $pos->z > $plotCorners[1]->y){
+					continue;
+				}
+				$valid = true;
+				break;
+			}
+		}else{
+			$valid = true;
+		}
+		if(!$valid){
+			return;
+		}
+		if($this->isAsynchronous()){
+			$this->getChunkManager()->setBlockIdAt((int) $pos->x, (int) $pos->y, (int) $pos->z, $id);
+			$this->getChunkManager()->setBlockDataAt((int) $pos->x, (int) $pos->y, (int) $pos->z, $meta);
+		}else{
+			$this->getLevel()->setBlock($pos, Block::get($id, $meta), false, false);
+		}
+	}
+
+	/**
+	 * @return BlockSniperChunkManager
+	 */
+	public function getChunkManager() : BlockSniperChunkManager{
+		return $this->chunkManager;
+	}
+
+	/**
+	 * @param ChunkManager $manager
+	 *
+	 * @return BaseType
+	 */
+	public function setChunkManager(ChunkManager $manager) : self{
+		$this->chunkManager = $manager;
+
+		return $this;
+	}
+
+	/**
+	 * Returns the level the type is used in.
+	 *
+	 * @return Level|null
+	 */
+	public function getLevel() : ?Level{
+		return Server::getInstance()->getLevel($this->level);
+	}
+
+	/**
+	 * @param Vector3 $pos
+	 * @param int     $biomeId
+	 */
+	protected function putBiome(Vector3 $pos, int $biomeId) : void{
+		$valid = false;
+		if($this->myPlotChecked){
+			foreach($this->plotPoints as $plotCorners){
+				if($pos->x < $plotCorners[0]->x || $pos->z < $plotCorners[0]->z || $pos->x > $plotCorners[1]->x || $pos->z > $plotCorners[1]->z){
+					continue;
+				}
+				$valid = true;
+				break;
+			}
+		}else{
+			$valid = true;
+		}
+		if(!$valid){
+			return;
+		}
+		if($this->isAsynchronous()){
+			$this->getChunkManager()->setBiomeIdAt($pos->x, $pos->z, $biomeId);
+		}else{
+			$this->getLevel()->setBiomeId($pos->x, $pos->z, $biomeId);
+		}
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use pocketmine\math\AxisAlignedBB;
+use pocketmine\Player;
+
+/*
+ * Clears all entities within the brush radius. This brush can not undo.
+ */
+
+class CleanEntitiesType extends BaseType{
+
+	const ID = self::TYPE_CLEAN_ENTITIES;
+
+	public function getName() : string{
+		return "Clean Entities";
+	}
+
+	public function canBeExecutedAsynchronously() : bool{
+		return false;
+	}
+
+	/**
+	 * @return \Generator
+	 */
+	protected function fillSynchronously() : \Generator{
+		foreach($this->blocks as $block){
+			foreach($block->getLevel()->getNearbyEntities(new AxisAlignedBB($block->x, $block->y, $block->z, $block->x + 1, $block->y + 1, $block->z + 1)) as $entity){
+				if(!($entity instanceof Player)){
+					$entity->close();
+				}
+			}
+		}
+		if(false){
+			// Make PHP recognize this is a generator.
+			yield;
+		}
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use pocketmine\block\Block;
+
+/*
+ * Removes all non-natural blocks within the brush radius.
+ */
+
+class CleanType extends BaseType{
+
+	const ID = self::TYPE_CLEAN;
+
+	public function getName() : string{
+		return "Clean";
+	}
+
+	/**
+	 * @return \Generator
+	 */
+	protected function fillSynchronously() : \Generator{
+		foreach($this->blocks as $block){
+			$blockId = $block->getId();
+			if($blockId !== Block::AIR && $blockId !== Block::STONE && $blockId !== Block::GRASS && $blockId !== Block::DIRT && $blockId !== Block::GRAVEL && $blockId !== Block::SAND && $blockId !== Block::SANDSTONE){
+				yield $block;
+				$this->putBlock($block, 0);
+			}
+		}
+	}
+
+	protected function fillAsynchronously() : void{
+		foreach($this->blocks as $block){
+			$blockId = $block->getId();
+			if($blockId !== Block::AIR && $blockId !== Block::STONE && $blockId !== Block::GRASS && $blockId !== Block::DIRT && $blockId !== Block::GRAVEL && $blockId !== Block::SAND && $blockId !== Block::SANDSTONE){
+				$this->putBlock($block, $blockId);
+			}
+		}
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use pocketmine\item\Item;
+
+/*
+ * Removes all liquid blocks within the brush radius.
+ */
+
+class DrainType extends BaseType{
+
+	const ID = self::TYPE_DRAIN;
+
+	/**
+	 * @return \Generator
+	 */
+	public function fillSynchronously() : \Generator{
+		foreach($this->blocks as $block){
+			$blockId = $block->getId();
+			if($blockId === Item::LAVA || $blockId === Item::WATER || $blockId === Item::STILL_LAVA || $blockId === Item::STILL_WATER){
+				yield $block;
+				$this->putBlock($block, 0);
+			}
+		}
+	}
+
+	public function fillAsynchronously() : void{
+		foreach($this->blocks as $block){
+			$blockId = $block->getId();
+			if($blockId === Item::LAVA || $blockId === Item::WATER || $blockId === Item::STILL_LAVA || $blockId === Item::STILL_WATER){
+				$this->putBlock($block, 0);
+			}
+		}
+	}
+
+	public function getName() : string{
+		return "Drain";
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use pocketmine\block\Block;
+use pocketmine\item\Item;
+
+/*
+ * Expands the terrain with blocks below it.
+ */
+
+class ExpandType extends BaseType{
+
+	const ID = self::TYPE_EXPAND;
+
+	/**
+	 * @return \Generator
+	 */
+	public function fillSynchronously() : \Generator{
+		$undoBlocks = [];
+		$oneHoles = [];
+		foreach($this->blocks as $block){
+			if($block->getId() === Item::AIR){
+				$directions = [
+					$block->getSide(Block::SIDE_DOWN),
+					$block->getSide(Block::SIDE_UP),
+					$block->getSide(Block::SIDE_NORTH),
+					$block->getSide(Block::SIDE_SOUTH),
+					$block->getSide(Block::SIDE_WEST),
+					$block->getSide(Block::SIDE_EAST)
+				];
+
+				$valid = 0;
+				foreach($directions as $direction){
+					if($direction->getId() !== Item::AIR){
+						$valid++;
+					}
+				}
+				if($valid >= 2){
+					$undoBlocks[] = $block;
+				}
+				if($valid >= 4){
+					$oneHoles[] = $block;
+				}
+			}
+		}
+		foreach($undoBlocks as $selectedBlock){
+			/** @var Block $undoBlock */
+			$undoBlock = ($selectedBlock->getSide(Block::SIDE_DOWN)->getId() === Block::AIR ? $selectedBlock->getSide(Block::SIDE_UP) : $selectedBlock->getSide(Block::SIDE_DOWN));
+			yield $undoBlock;
+			$this->putBlock($selectedBlock, $undoBlock->getId(), $undoBlock->getDamage());
+		}
+		foreach($oneHoles as $block){
+			/** @var Block $oneHole */
+			$oneHole = ($block->getSide(Block::SIDE_DOWN)->getId() === Block::AIR ? $block->getSide(Block::SIDE_EAST) : $block->getSide(Block::SIDE_DOWN));
+			yield $oneHole;
+			$this->putBlock($block, $oneHole->getId(), $oneHole->getDamage());
+		}
+	}
+
+	public function fillAsynchronously() : void{
+		$oneHoles = [];
+		$blocks = [];
+		foreach($this->blocks as $block){
+			if($block->getId() === Item::AIR){
+				$directions = [
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_DOWN),
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_UP),
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_NORTH),
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_SOUTH),
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_WEST),
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_EAST),
+				];
+
+				$valid = 0;
+				foreach($directions as $direction){
+					if($direction->getId() !== Item::AIR){
+						$valid++;
+					}
+				}
+				if($valid >= 2){
+					$blocks[] = $block;
+				}
+				if($valid >= 4){
+					$oneHoles[] = $block;
+				}
+			}
+		}
+		foreach($blocks as $selectedBlock){
+			$bottom = $this->getChunkManager()->getSide($selectedBlock->x, $selectedBlock->y, $selectedBlock->z, Block::SIDE_DOWN);
+			$top = $this->getChunkManager()->getSide($selectedBlock->x, $selectedBlock->y, $selectedBlock->z, Block::SIDE_UP);
+			$this->putBlock($selectedBlock, $bottom->getId() === Block::AIR ? $top->getId() : $bottom->getId(), $bottom->getId() === Block::AIR ? $top->getDamage() : $bottom->getDamage());
+		}
+		foreach($oneHoles as $block){
+			$bottom = $this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_DOWN);
+			$east = $this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_UP);
+			$this->putBlock($block, $bottom->getId() === Block::AIR ? $east->getId() : $bottom->getId(), $bottom->getId() === Block::AIR ? $east->getDamage() : $bottom->getDamage());
+		}
+	}
+
+	public function getName() : string{
+		return "Expand";
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+
+/*
+ * Places blocks on every location within the brush radius.
+ */
+
+class FillType extends BaseType{
+
+	const ID = self::TYPE_FILL;
+
+	/**
+	 * @return \Generator
+	 */
+	public function fillSynchronously() : \Generator{
+		foreach($this->blocks as $block){
+			$randomBlock = $this->brushBlocks[array_rand($this->brushBlocks)];
+			yield $block;
+			$this->putBlock($block, $randomBlock->getId(), $randomBlock->getDamage());
+		}
+	}
+
+	public function fillAsynchronously() : void{
+		foreach($this->blocks as $block){
+			$randomBlock = $this->brushBlocks[array_rand($this->brushBlocks)];
+			$this->putBlock($block, $randomBlock->getId(), $randomBlock->getDamage());
+		}
+	}
+
+	public function getName() : string{
+		return "Fill";
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use pocketmine\block\Flowable;
+use pocketmine\item\Item;
+use pocketmine\level\ChunkManager;
+use pocketmine\math\Vector3;
+use pocketmine\Player;
+
+/*
+ * Flattens the terrain below the selected point and removes the blocks above it within the brush radius.
+ */
+
+class FlattenAllType extends BaseType{
+
+	const ID = self::TYPE_FLATTEN_ALL;
+
+	public function __construct(Player $player, ChunkManager $level, \Generator $blocks){
+		parent::__construct($player, $level, $blocks);
+		$this->center = $player->getTargetBlock(100)->asVector3();
+	}
+
+	/**
+	 * @return \Generator
+	 */
+	public function fillSynchronously() : \Generator{
+		foreach($this->blocks as $block){
+			$randomBlock = $this->brushBlocks[array_rand($this->brushBlocks)];
+			if($block->y <= $this->center->y && ($block->getId() === Item::AIR || $block instanceof Flowable)){
+				yield $block;
+				$this->putBlock($block, $randomBlock->getId(), $randomBlock->getDamage());
+			}
+			if($block->y > $this->center->y && $block->getId() !== Item::AIR){
+				yield $block;
+				$this->putBlock($block, 0);
+			}
+		}
+	}
+
+	public function fillAsynchronously() : void{
+		foreach($this->blocks as $block){
+			$randomBlock = $this->brushBlocks[array_rand($this->brushBlocks)];
+			if($block->y <= $this->center->y && ($block->getId() === Item::AIR || $block instanceof Flowable)){
+				$this->putBlock($block, $randomBlock->getId(), $randomBlock->getDamage());
+			}
+			if($block->y > $this->center->y && $block->getId() !== Item::AIR){
+				$this->putBlock($block, 0);
+			}
+		}
+	}
+
+	public function getName() : string{
+		return "Flatten All";
+	}
+
+	/**
+	 * Returns the center of this type.
+	 *
+	 * @return Vector3
+	 */
+	public function getCenter() : Vector3{
+		return $this->center;
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use pocketmine\block\Flowable;
+use pocketmine\item\Item;
+use pocketmine\level\ChunkManager;
+use pocketmine\math\Vector3;
+use pocketmine\Player;
+
+/*
+ * Flattens the terrain below the selected point within the brush radius.
+ */
+
+class FlattenType extends BaseType{
+
+	const ID = self::TYPE_FLATTEN;
+
+	public function __construct(Player $player, ChunkManager $level, \Generator $blocks){
+		parent::__construct($player, $level, $blocks);
+		$this->center = $player->getTargetBlock(100)->asVector3();
+	}
+
+	/**
+	 * @return \Generator
+	 */
+	public function fillSynchronously() : \Generator{
+		foreach($this->blocks as $block){
+			$randomBlock = $this->brushBlocks[array_rand($this->brushBlocks)];
+			if($block->y <= $this->center->y && ($block->getId() === Item::AIR || $block instanceof Flowable)){
+				yield $block;
+				$this->putBlock($block, $randomBlock->getId(), $randomBlock->getDamage());
+			}
+		}
+	}
+
+	public function fillAsynchronously() : void{
+		foreach($this->blocks as $block){
+			$randomBlock = $this->brushBlocks[array_rand($this->brushBlocks)];
+			if($block->y <= $this->center->y && ($block->getId() === Item::AIR || $block instanceof Flowable)){
+				$this->putBlock($block, $randomBlock->getId(), $randomBlock->getDamage());
+			}
+		}
+	}
+
+	public function getName() : string{
+		return "Flatten";
+	}
+
+	/**
+	 * Returns the center of this type.
+	 *
+	 * @return Vector3
+	 */
+	public function getCenter() : Vector3{
+		return $this->center;
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use pocketmine\level\ChunkManager;
+use pocketmine\math\Vector3;
+use pocketmine\Player;
+
+/*
+ * Lays a thin layer of blocks within the brush radius.
+ */
+
+class LayerType extends BaseType{
+
+	const ID = self::TYPE_LAYER;
+
+	public function __construct(Player $player, ChunkManager $level, \Generator $blocks){
+		parent::__construct($player, $level, $blocks);
+		$this->center = $player->getTargetBlock(100)->asVector3();
+	}
+
+	/**
+	 * @return \Generator
+	 */
+	public function fillSynchronously() : \Generator{
+		foreach($this->blocks as $block){
+			if($block->y !== $this->center->y + 1){
+				continue;
+			}
+			$randomBlock = $this->brushBlocks[array_rand($this->brushBlocks)];
+			yield $block;
+			$vec = new Vector3($block->x, $this->center->y + 1, $block->z);
+			$this->putBlock($vec, $randomBlock->getId(), $randomBlock->getDamage());
+		}
+	}
+
+	public function fillAsynchronously() : void{
+		foreach($this->blocks as $block){
+			if($block->y !== $this->center->y + 1){
+				continue;
+			}
+			$randomBlock = $this->brushBlocks[array_rand($this->brushBlocks)];
+			$vec = new Vector3($block->x, $this->center->y + 1, $block->z);
+			$this->putBlock($vec, $randomBlock->getId(), $randomBlock->getDamage());
+		}
+	}
+
+	public function getName() : string{
+		return "Layer";
+	}
+
+	/**
+	 * Returns the center of this type.
+	 *
+	 * @return Vector3
+	 */
+	public function getCenter() : Vector3{
+		return $this->center;
+	}
+}
+
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use BlockHorizons\BlockSniper\Loader;
+use pocketmine\block\Flowable;
+use pocketmine\item\Item;
+use pocketmine\Server;
+
+/*
+ * Blows away all plants and flowers within the brush radius.
+ */
+
+class LeafBlowerType extends BaseType{
+
+	const ID = self::TYPE_LEAF_BLOWER;
+
+	/**
+	 * @return \Generator
+	 */
+	public function fillSynchronously() : \Generator{
+		/** @var Loader $loader */
+		$loader = Server::getInstance()->getPluginManager()->getPlugin("BlockSniper");
+		if($loader === null){
+			return;
+		}
+		$dropPlants = $loader->config->dropLeafBlowerPlants;
+		foreach($this->blocks as $block){
+			if($block instanceof Flowable){
+				yield $block;
+				if($dropPlants){
+					$this->getLevel()->dropItem($block, Item::get($block->getId()));
+				}
+				$this->putBlock($block, 0);
+			}
+		}
+	}
+
+	public function fillAsynchronously() : void{
+		foreach($this->blocks as $block){
+			if($block instanceof Flowable){
+				$this->putBlock($block, 0);
+			}
+		}
+	}
+
+	public function getName() : string{
+		return "Leaf Blower";
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use pocketmine\block\Block;
+use pocketmine\item\Item;
+
+/*
+ * Melts away every block with more than 2 open sides within the brush radius.
+ */
+
+class MeltType extends BaseType{
+
+	const ID = self::TYPE_MELT;
+
+	/**
+	 * @return \Generator
+	 */
+	public function fillSynchronously() : \Generator{
+		$blocks = [];
+		foreach($this->blocks as $block){
+			if($block->getId() !== Item::AIR){
+				$directions = [
+					$block->getSide(Block::SIDE_DOWN),
+					$block->getSide(Block::SIDE_UP),
+					$block->getSide(Block::SIDE_NORTH),
+					$block->getSide(Block::SIDE_SOUTH),
+					$block->getSide(Block::SIDE_WEST),
+					$block->getSide(Block::SIDE_EAST)
+				];
+				$valid = 0;
+				foreach($directions as $direction){
+					if($direction->getId() === Item::AIR){
+						$valid++;
+					}
+				}
+				if($valid >= 2){
+					$blocks[] = $block;
+				}
+			}
+		}
+		foreach($blocks as $block){
+			yield $block;
+			$this->putBlock($block, 0);
+		}
+	}
+
+	public function fillAsynchronously() : void{
+		$blocks = [];
+		foreach($this->blocks as $block){
+			if($block->getId() !== Item::AIR){
+				$directions = [
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_DOWN),
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_UP),
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_NORTH),
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_SOUTH),
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_WEST),
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_EAST),
+				];
+				$valid = 0;
+				foreach($directions as $direction){
+					if($direction->getId() === Item::AIR){
+						$valid++;
+					}
+				}
+				if($valid >= 2){
+					$blocks[] = $block;
+				}
+			}
+		}
+		foreach($blocks as $selectedBlock){
+			$this->putBlock($selectedBlock, 0);
+		}
+	}
+
+	public function getName() : string{
+		return "Melt";
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use pocketmine\block\Block;
+use pocketmine\item\Item;
+
+/*
+ * Lays a layer of blocks over every block within the brush radius.
+ */
+
+class OverlayType extends BaseType{
+
+	const ID = self::TYPE_OVERLAY;
+
+	/**
+	 * @return \Generator
+	 */
+	public function fillSynchronously() : \Generator{
+		foreach($this->blocks as $block){
+			if($block->getId() !== Item::AIR){
+				$directions = [
+					$block->getSide(Block::SIDE_DOWN),
+					$block->getSide(Block::SIDE_UP),
+					$block->getSide(Block::SIDE_NORTH),
+					$block->getSide(Block::SIDE_SOUTH),
+					$block->getSide(Block::SIDE_WEST),
+					$block->getSide(Block::SIDE_EAST)
+				];
+				$valid = true;
+				foreach($this->brushBlocks as $possibleBlock){
+					if($block->getId() === $possibleBlock->getId() && $block->getDamage() === $possibleBlock->getDamage()){
+						$valid = false;
+					}
+				}
+				foreach($directions as $direction){
+					if($valid && $this->getLevel()->getBlock($direction)->getId() === Item::AIR){
+						$randomBlock = $this->brushBlocks[array_rand($this->brushBlocks)];
+						if($block->getId() !== $randomBlock->getId()){
+							yield $direction;
+							$this->putBlock($direction, $randomBlock->getId(), $randomBlock->getDamage());
+						}
+					}
+				}
+			}
+		}
+	}
+
+	public function fillAsynchronously() : void{
+		foreach($this->blocks as $block){
+			if($block->getId() !== Item::AIR){
+				$directions = [
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_DOWN),
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_UP),
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_NORTH),
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_SOUTH),
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_WEST),
+					$this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_EAST),
+				];
+				$valid = true;
+				foreach($this->brushBlocks as $possibleBlock){
+					if($block->getId() === $possibleBlock->getId() && $block->getDamage() === $possibleBlock->getDamage()){
+						$valid = false;
+					}
+				}
+				foreach($directions as $direction){
+					if($valid && $this->getChunkManager()->getBlockIdAt($direction->x, $direction->y, $direction->z) === Item::AIR){
+						$randomBlock = $this->brushBlocks[array_rand($this->brushBlocks)];
+						if($block->getId() !== $randomBlock->getId()){
+							$this->putBlock($direction, $randomBlock->getId(), $randomBlock->getDamage());
+						}
+					}
+				}
+			}
+		}
+	}
+
+	public function getName() : string{
+		return "Overlay";
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use pocketmine\block\Block;
+use pocketmine\block\Flowable;
+
+/*
+ * Replaces every solid block within the brush radius.
+ */
+
+class ReplaceAllType extends BaseType{
+
+	const ID = self::TYPE_REPLACE_ALL;
+
+	/**
+	 * @return \Generator
+	 */
+	public function fillSynchronously() : \Generator{
+		foreach($this->blocks as $block){
+			if(!$block instanceof Flowable && $block->getId() !== Block::AIR){
+				$randomBlock = $this->brushBlocks[array_rand($this->brushBlocks)];
+				yield $block;
+				$this->putBlock($block, $randomBlock->getId(), $randomBlock->getDamage());
+			}
+		}
+	}
+
+	public function fillAsynchronously() : void{
+		foreach($this->blocks as $block){
+			if(!$block instanceof Flowable && $block->getId() !== Block::AIR){
+				$randomBlock = $this->brushBlocks[array_rand($this->brushBlocks)];
+				$this->putBlock($block, $randomBlock->getId(), $randomBlock->getDamage());
+			}
+		}
+	}
+
+	public function getName() : string{
+		return "Replace All";
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use BlockHorizons\BlockSniper\sessions\SessionManager;
+use pocketmine\level\ChunkManager;
+use pocketmine\Player;
+
+/*
+ * Replaces the obsolete blocks within the brush radius.
+ */
+
+class ReplaceType extends BaseType{
+
+	const ID = self::TYPE_REPLACE;
+
+	public function __construct(Player $player, ChunkManager $level, \Generator $blocks){
+		parent::__construct($player, $level, $blocks);
+		$this->obsolete = SessionManager::getPlayerSession($player)->getBrush()->getObsolete();
+	}
+
+	/**
+	 * @return \Generator
+	 */
+	public function fillSynchronously() : \Generator{
+		foreach($this->blocks as $block){
+			$randomBlock = $this->brushBlocks[array_rand($this->brushBlocks)];
+			foreach($this->obsolete as $obsolete){
+				if($block->getId() === $obsolete->getId() and $block->getDamage() === $obsolete->getDamage()){
+					yield $block;
+					$this->putBlock($block, $randomBlock->getId(), $randomBlock->getDamage());
+				}
+			}
+		}
+	}
+
+	public function fillAsynchronously() : void{
+		foreach($this->blocks as $block){
+			$randomBlock = $this->brushBlocks[array_rand($this->brushBlocks)];
+			foreach($this->obsolete as $obsolete){
+				if($block->getId() === $obsolete->getId() and $block->getDamage() === $obsolete->getDamage()){
+					$this->putBlock($block, $randomBlock->getId(), $randomBlock->getDamage());
+				}
+			}
+		}
+	}
+
+	public function getName() : string{
+		return "Replace";
+	}
+
+	/**
+	 * Returns the obsolete blocks of this type.
+	 *
+	 * @return array
+	 */
+	public function getObsolete() : \Generator{
+		return $this->obsolete;
+	}
+}
+
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use pocketmine\block\Block;
+use pocketmine\block\Flowable;
+
+/*
+ * Lays a layer of snow on top of the terrain, and raises it if there is snow already.
+ */
+
+class SnowConeType extends BaseType{
+
+	const ID = self::TYPE_SNOW_CONE;
+
+	/**
+	 * @return \Generator
+	 */
+	public function fillSynchronously() : \Generator{
+		foreach($this->blocks as $block){
+			if(!($block instanceof Flowable) && ($id = $block->getId()) !== Block::AIR && $id !== Block::SNOW_LAYER){
+				$topBlock = $block->getSide(Block::SIDE_UP);
+				if(($topId = $topBlock->getId()) === Block::AIR || $topId === Block::SNOW_LAYER){
+					if($topBlock->getDamage() < 7 && $topBlock->getId() === Block::SNOW_LAYER){
+						yield $topBlock;
+						$this->putBlock($topBlock, $topBlock->getId(), $topBlock->getDamage() + 1);
+					}elseif($topId !== Block::SNOW_LAYER){
+						yield $topBlock;
+						$this->putBlock($topBlock, Block::SNOW_LAYER);
+					}
+				}
+			}
+		}
+	}
+
+	public function fillAsynchronously() : void{
+		foreach($this->blocks as $block){
+			if(!($block instanceof Flowable) && ($id = $block->getId()) !== Block::AIR && $id !== Block::SNOW_LAYER){
+				$topBlock = $this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_UP);
+				if(($topId = $topBlock->getId()) === Block::AIR || $topId === Block::SNOW_LAYER){
+					if($topBlock->getDamage() < 7 && $topBlock->getId() === Block::SNOW_LAYER){
+						$this->putBlock($topBlock, $topBlock->getId(), $topBlock->getDamage() + 1);
+					}elseif($topId !== Block::SNOW_LAYER){
+						$this->putBlock($topBlock, Block::SNOW_LAYER);
+					}
+				}
+			}
+		}
+	}
+
+	public function getName() : string{
+		return "Snow Cone";
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use BlockHorizons\BlockSniper\sessions\SessionManager;
+use pocketmine\block\Block;
+use pocketmine\block\Flowable;
+use pocketmine\item\Item;
+use pocketmine\level\ChunkManager;
+use pocketmine\math\Vector3;
+use pocketmine\Player;
+
+/*
+ * Replaces the top layer of the terrain, thickness depending on brush height, within the brush radius.
+ */
+
+class TopLayerType extends BaseType{
+
+	const ID = self::TYPE_TOP_LAYER;
+
+	public function __construct(Player $player, ChunkManager $level, \Generator $blocks){
+		parent::__construct($player, $level, $blocks);
+		$this->height = SessionManager::getPlayerSession($player)->getBrush()->height;
+	}
+
+	/**
+	 * @return \Generator
+	 */
+	public function fillSynchronously() : \Generator{
+		foreach($this->blocks as $block){
+			if(!$block instanceof Flowable && $block->getId() !== Item::AIR){
+				$up = $block->getSide(Block::SIDE_UP);
+				if($up instanceof Flowable || $up->getId() === Item::AIR){
+					$randomBlock = $this->brushBlocks[array_rand($this->brushBlocks)];
+					for($y = $block->y; $y >= $block->y - $this->height; $y--){
+						yield $this->getLevel()->getBlock(new Vector3($block->x, $y, $block->z));
+						$this->putBlock($block, $randomBlock->getId(), $randomBlock->getDamage());
+					}
+				}
+			}
+		}
+	}
+
+	public function fillAsynchronously() : void{
+		foreach($this->blocks as $block){
+			if(!$block instanceof Flowable && $block->getId() !== Item::AIR){
+				$up = $this->getChunkManager()->getSide($block->x, $block->y, $block->z, Block::SIDE_UP);
+				if($up instanceof Flowable || $up->getId() === Item::AIR){
+					$randomBlock = $this->brushBlocks[array_rand($this->brushBlocks)];
+					for($y = $block->y; $y >= $block->y - $this->height; $y--){
+						$this->putBlock($block, $randomBlock->getId(), $randomBlock->getDamage());
+					}
+				}
+			}
+		}
+	}
+
+	public function getName() : string{
+		return "Top Layer";
+	}
+
+	/**
+	 * Returns the height/width of the top layer.
+	 *
+	 * @return int
+	 */
+	public function getHeight() : int{
+		return $this->height;
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use BlockHorizons\BlockSniper\brush\Brush;
+use BlockHorizons\BlockSniper\brush\TreeProperties;
+use BlockHorizons\BlockSniper\sessions\SessionManager;
+use pocketmine\level\ChunkManager;
+use pocketmine\Player;
+
+/*
+ * Grows a custom tree on the target block.
+ */
+
+class TreeType extends BaseType{
+
+	const ID = self::TYPE_TREE;
+
+	/** @var Brush */
+	private $brush;
+
+	public function __construct(Player $player, ChunkManager $level){
+		parent::__construct($player, $level);
+		$this->center = $player->getTargetBlock(100)->asPosition();
+		$this->brush = SessionManager::getPlayerSession($player)->getBrush();
+	}
+
+	/**
+	 * @return \Generator
+	 */
+	public function fillSynchronously() : \Generator{
+		if(false){
+			yield;
+		}
+		$tree = new Tree($this->center, $this->brush, $this);
+		foreach($tree->build() as $block){
+			yield $block;
+		}
+	}
+
+	/**
+	 * @return string
+	 */
+	public function getName() : string{
+		return "Tree";
+	}
+
+	/**
+	 * Returns the tree properties of this type.
+	 *
+	 * @return TreeProperties
+	 */
+	public function getTree() : TreeProperties{
+		return $this->brush->tree;
+	}
+
+	/**
+	 * @return bool
+	 */
+	public function canBeExecutedAsynchronously() : bool{
+		return false;
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use pocketmine\level\ChunkManager;
+use pocketmine\level\format\Chunk;
+use pocketmine\math\Vector3;
+use pocketmine\Player;
+
+/*
+ * Regenerates the chunk looked at.
+ * This brush can NOT undo.
+ */
+
+class RegenerateType extends BaseType{
+
+	const ID = self::TYPE_REGENERATE;
+
+	public function __construct(Player $player, ChunkManager $manager, \Generator $blocks){
+		parent::__construct($player, $manager, $blocks);
+		$this->center = $player->getTargetBlock(100)->asVector3();
+	}
+
+	/**
+	 * @return \Generator
+	 */
+	public function fillSynchronously() : \Generator{
+		if($this->myPlotChecked){
+			return;
+		}
+		$x = $this->center->x >> 4;
+		$z = $this->center->z >> 4;
+
+		$this->getLevel()->setChunk($x, $z, new Chunk($x, $z));
+
+		$this->getLevel()->populateChunk($x, $z, true);
+
+		if(false){
+			// Make PHP recognize this is a generator.
+			yield;
+		}
+
+		return;
+	}
+
+	public function canBeExecutedAsynchronously() : bool{
+		return false;
+	}
+
+	public function getName() : string{
+		return "Chunk Regenerate";
+	}
+
+	/**
+	 * Returns the center of this type.
+	 *
+	 * @return Vector3
+	 */
+	public function getCenter() : Vector3{
+		return $this->center;
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use pocketmine\block\Block;
+
+/*
+ * Freezes the terrain, causing water to become ice, lava to become obsidian and extinguishes fire.
+ */
+
+class FreezeType extends BaseType{
+
+	const ID = self::TYPE_FREEZE;
+
+	public function fillSynchronously() : \Generator{
+		foreach($this->blocks as $block){
+			switch($block->getId()){
+				case Block::WATER:
+				case Block::FLOWING_WATER:
+					yield $block;
+					$this->putBlock($block, Block::ICE);
+					break;
+				case Block::LAVA:
+				case Block::FLOWING_LAVA:
+					yield $block;
+					$this->putBlock($block, Block::OBSIDIAN);
+					break;
+				case Block::FIRE:
+					yield $block;
+					$this->putBlock($block, 0);
+					break;
+				case Block::ICE:
+					yield $block;
+					$this->putBlock($block, Block::PACKED_ICE);
+			}
+		}
+	}
+
+	public function fillAsynchronously() : void{
+		foreach($this->blocks as $block){
+			switch($block->getId()){
+				case Block::WATER:
+				case Block::FLOWING_WATER:
+					$this->putBlock($block, Block::ICE);
+					break;
+				case Block::LAVA:
+				case Block::FLOWING_LAVA:
+					$this->putBlock($block, Block::OBSIDIAN);
+					break;
+				case Block::FIRE:
+					$this->putBlock($block, 0);
+					break;
+				case Block::ICE:
+					$this->putBlock($block, Block::PACKED_ICE);
+			}
+		}
+	}
+
+	public function getName() : string{
+		return "Freeze";
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use pocketmine\block\Block;
+
+class WarmType extends BaseType{
+
+	const ID = self::TYPE_WARM;
+
+	public function fillSynchronously() : \Generator{
+		foreach($this->blocks as $block){
+			switch($block->getId()){
+				case Block::ICE:
+					yield $block;
+					$this->putBlock($block, Block::WATER);
+					break;
+				case Block::SNOW_LAYER:
+					yield $block;
+					$this->putBlock($block, 0);
+					break;
+				case Block::PACKED_ICE:
+					yield $block;
+					$this->putBlock($block, Block::ICE);
+			}
+		}
+	}
+
+	public function fillAsynchronously() : void{
+		foreach($this->blocks as $block){
+			switch($block->getId()){
+				case Block::ICE:
+					$this->putBlock($block, Block::WATER);
+					break;
+				case Block::SNOW_LAYER:
+					$this->putBlock($block, 0);
+					break;
+				case Block::PACKED_ICE:
+					$this->putBlock($block, Block::ICE);
+			}
+		}
+	}
+
+	public function getName() : string{
+		return "Warm";
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\brush\types;
+
+use BlockHorizons\BlockSniper\brush\BaseType;
+use pocketmine\block\Block;
+use pocketmine\block\Dandelion;
+use pocketmine\block\DoublePlant;
+use pocketmine\block\Flower;
+use pocketmine\block\Leaves;
+use pocketmine\block\Leaves2;
+use pocketmine\block\TallGrass;
+
+class HeatType extends BaseType{
+
+	const ID = self::TYPE_HEAT;
+
+	public function fillSynchronously() : \Generator{
+		foreach($this->blocks as $block){
+			switch($block->getId()){
+				case Block::ICE:
+					yield $block;
+					$this->putBlock($block, Block::WATER);
+					break;
+				case Block::SNOW_LAYER:
+					yield $block;
+					$this->putBlock($block, 0);
+					break;
+				case Block::PACKED_ICE:
+					yield $block;
+					$this->putBlock($block, Block::WATER);
+					break;
+				case Block::SNOW:
+					yield $block;
+					$this->putBlock($block, 0);
+					break;
+				case Block::WATER:
+				case Block::FLOWING_WATER:
+					if(random_int(0, 4) === 0){
+						yield $block;
+						$this->putBlock($block, 0);
+					}
+					break;
+				case Block::GRASS:
+					$random = random_int(0, 8);
+					if($random === 0){
+						yield $block;
+						$this->putBlock($block, Block::DIRT);
+					}elseif($random === 1){
+						yield $block;
+						$this->putBlock($block, Block::DIRT, 1);
+					}
+					break;
+				case $block instanceof Leaves || $block instanceof Leaves2:
+					if(random_int(0, 4) === 0){
+						yield $block;
+						$this->putBlock($block, 0);
+					}
+					break;
+				case $block instanceof Flower || $block instanceof DoublePlant || $block instanceof TallGrass || $block instanceof Dandelion:
+					yield $block;
+					$this->putBlock($block, Block::TALL_GRASS);
+					break;
+			}
+		}
+	}
+
+	public function fillAsynchronously() : void{
+		foreach($this->blocks as $block){
+			switch($block->getId()){
+				case Block::ICE:
+					$this->putBlock($block, Block::WATER);
+					break;
+				case Block::SNOW_LAYER:
+					$this->putBlock($block, 0);
+					break;
+				case Block::PACKED_ICE:
+					$this->putBlock($block, Block::WATER);
+					break;
+				case Block::SNOW:
+					$this->putBlock($block, 0);
+					break;
+				case Block::WATER:
+				case Block::FLOWING_WATER:
+					if(random_int(0, 4) === 0){
+						$this->putBlock($block, 0);
+					}
+					break;
+				case Block::GRASS:
+					$random = random_int(0, 8);
+					if($random === 0){
+						$this->putBlock($block, Block::DIRT);
+					}elseif($random === 1){
+						$this->putBlock($block, Block::DIRT, 1);
+					}
+					break;
+				case $block instanceof Leaves || $block instanceof Leaves2:
+					if(random_int(0, 4) === 0){
+						$this->putBlock($block, 0);
+					}
+					break;
+				case $block instanceof Flower || $block instanceof DoublePlant || $block instanceof TallGrass || $block instanceof Dandelion:
+					$this->putBlock($block, Block::TALL_GRASS);
+					break;
+			}
+		}
+	}
+
+	public function getName() : string{
+		return "Heat";
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\commands;
+
+use BlockHorizons\BlockSniper\data\Translation;
+use BlockHorizons\BlockSniper\Loader;
+use BlockHorizons\BlockSniper\ui\windows\ConfigurationMenuWindow;
+use BlockHorizons\BlockSniper\ui\windows\MainMenuWindow;
+use pocketmine\command\CommandSender;
+use pocketmine\Player;
+use pocketmine\utils\TextFormat as TF;
+
+class BlockSniperCommand extends BaseCommand{
+
+	private $info = "";
+
+	public function __construct(Loader $loader){
+		parent::__construct($loader, "blocksniper", Translation::COMMANDS_BLOCKSNIPER_DESCRIPTION, "/blocksniper [menu|reload]", ["bs"], true);
+		$this->info = TF::AQUA . "[BlockSniper] " . Translation::get(Translation::COMMANDS_BLOCKSNIPER_INFO) . "\n" .
+			TF::GREEN . Translation::get(Translation::COMMANDS_BLOCKSNIPER_VERSION) . TF::YELLOW . Loader::VERSION . "\n" .
+			TF::GREEN . Translation::get(Translation::COMMANDS_BLOCKSNIPER_TARGET_API) . TF::YELLOW . Loader::API_TARGET . "\n" .
+			TF::GREEN . Translation::get(Translation::COMMANDS_BLOCKSNIPER_ORGANISATION) . TF::YELLOW . "BlockHorizons (https://github.com/BlockHorizons/BlockSniper)\n" .
+			TF::GREEN . Translation::get(Translation::COMMANDS_BLOCKSNIPER_AUTHORS) . TF::YELLOW . "Sandertv (@Sandertv), Chris-Prime (@PrimusLV)";
+	}
+
+	public function onExecute(CommandSender $sender, string $commandLabel, array $args) : void{
+		if(!isset($args[0])){
+			$args[0] = "";
+		}
+
+		switch(strtolower($args[0])){
+			case "reload":
+				$sender->sendMessage(TF::GREEN . Translation::get(Translation::COMMANDS_BLOCKSNIPER_RELOAD));
+				$this->loader->reload();
+
+				return;
+
+			case "menu":
+			case "window":
+				if(!$sender instanceof Player){
+					$this->sendConsoleError($sender);
+
+					return;
+				}
+				$sender->sendForm(new MainMenuWindow($this->loader, $sender));
+
+				return;
+
+			case "config":
+				if(!$sender instanceof Player){
+					$this->sendConsoleError($sender);
+
+					return;
+				}
+				$sender->sendForm(new ConfigurationMenuWindow($this->loader, $sender));
+
+				return;
+
+			default:
+				$sender->sendMessage($this->info);
+		}
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\commands;
+
+use BlockHorizons\BlockSniper\data\Translation;
+use BlockHorizons\BlockSniper\Loader;
+use pocketmine\command\Command;
+use pocketmine\command\CommandSender;
+use pocketmine\command\PluginIdentifiableCommand;
+use pocketmine\Player;
+use pocketmine\plugin\Plugin;
+use pocketmine\utils\TextFormat as TF;
+
+abstract class BaseCommand extends Command implements PluginIdentifiableCommand{
+
+	/** @var Loader */
+	protected $loader = null;
+	/** @var bool */
+	protected $consoleUsable = false;
+
+	public function __construct(Loader $loader, string $name, string $description, string $usageMessage, array $aliases = [], bool $consoleUsable = false){
+		parent::__construct($name, Translation::get($description), "[Usage] " . $usageMessage, $aliases);
+		$this->loader = $loader;
+		$this->consoleUsable = $consoleUsable;
+		$this->setPermission("blocksniper.command." . $name);
+	}
+
+	/**
+	 * @param CommandSender $sender
+	 */
+	public function sendConsoleError(CommandSender $sender) : void{
+		$sender->sendMessage($this->getWarning() . Translation::get(Translation::COMMANDS_COMMON_INVALID_SENDER));
+	}
+
+	/**
+	 * @return string
+	 */
+	public function getWarning() : string{
+		return TF::RED . Translation::get(Translation::COMMANDS_COMMON_WARNING_PREFIX);
+	}
+
+	/**
+	 * @return Plugin
+	 */
+	public function getPlugin() : Plugin{
+		return $this->loader;
+	}
+
+	/**
+	 * @param CommandSender $sender
+	 */
+	public function sendNoPermission(CommandSender $sender) : void{
+		$sender->sendMessage($this->getWarning() . Translation::get(Translation::COMMANDS_COMMON_NO_PERMISSION));
+	}
+
+	/**
+	 * @param CommandSender $sender
+	 * @param string        $commandLabel
+	 * @param array         $args
+	 */
+	public function execute(CommandSender $sender, string $commandLabel, array $args) : void{
+		if(!$this->testPermission($sender)){
+			$this->sendNoPermission($sender);
+
+			return;
+		}
+		if(!$this->consoleUsable && (!$sender instanceof Player)){
+			$this->sendConsoleError($sender);
+
+			return;
+		}
+		$this->onExecute($sender, $commandLabel, $args);
+	}
+
+	/**
+	 * @param CommandSender $sender
+	 * @param string        $commandLabel
+	 * @param array         $args
+	 */
+	public abstract function onExecute(CommandSender $sender, string $commandLabel, array $args) : void;
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\commands;
+
+use BlockHorizons\BlockSniper\data\Translation;
+use BlockHorizons\BlockSniper\Loader;
+use BlockHorizons\BlockSniper\ui\windows\MainMenuWindow;
+use pocketmine\command\CommandSender;
+use pocketmine\Player;
+
+class BrushCommand extends BaseCommand{
+
+	public function __construct(Loader $loader){
+		parent::__construct($loader, "brush", Translation::COMMANDS_BRUSH_DESCRIPTION, "/brush", ["b"]);
+	}
+
+	public function onExecute(CommandSender $sender, string $commandLabel, array $args) : void{
+		/** @var Player $sender */
+		$sender->sendForm(new MainMenuWindow($this->loader, $sender));
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\commands;
+
+use BlockHorizons\BlockSniper\data\Translation;
+use BlockHorizons\BlockSniper\Loader;
+use BlockHorizons\BlockSniper\revert\Revert;
+use BlockHorizons\BlockSniper\sessions\SessionManager;
+use pocketmine\command\CommandSender;
+use pocketmine\Player;
+use pocketmine\utils\TextFormat as TF;
+
+class UndoCommand extends BaseCommand{
+
+	public function __construct(Loader $loader){
+		parent::__construct($loader, "undo", Translation::COMMANDS_UNDO_DESCRIPTION, "/undo [amount]", ["u"]);
+	}
+
+	public function onExecute(CommandSender $sender, string $commandLabel, array $args) : void{
+		/** @var Player $sender */
+		if(!SessionManager::getPlayerSession($sender)->getRevertStore()->undoStorageExists()){
+			$sender->sendMessage($this->getWarning() . Translation::get(Translation::COMMANDS_UNDO_NO_UNDO));
+
+			return;
+		}
+
+		$undoAmount = 1;
+		if(isset($args[0])){
+			$undoAmount = (int) $args[0];
+			$totalUndo = SessionManager::getPlayerSession($sender)->getRevertStore()->getTotalStores(Revert::TYPE_UNDO);
+			if($undoAmount > $totalUndo || $args[0] === "all"){
+				$undoAmount = $totalUndo;
+			}
+		}
+
+		SessionManager::getPlayerSession($sender)->getRevertStore()->restoreLatestRevert(Revert::TYPE_UNDO, $undoAmount);
+		$sender->sendMessage(TF::GREEN . Translation::get(Translation::COMMANDS_UNDO_SUCCESS) . TF::AQUA . " (" . $undoAmount . ")");
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\commands;
+
+use BlockHorizons\BlockSniper\data\Translation;
+use BlockHorizons\BlockSniper\Loader;
+use BlockHorizons\BlockSniper\revert\Revert;
+use BlockHorizons\BlockSniper\sessions\SessionManager;
+use pocketmine\command\CommandSender;
+use pocketmine\Player;
+use pocketmine\utils\TextFormat as TF;
+
+class RedoCommand extends BaseCommand{
+
+	public function __construct(Loader $loader){
+		parent::__construct($loader, "redo", Translation::COMMANDS_REDO_DESCRIPTION, "/redo [amount]");
+	}
+
+	public function onExecute(CommandSender $sender, string $commandLabel, array $args) : void{
+		/** @var Player $sender */
+		if(!SessionManager::getPlayerSession($sender)->getRevertStore()->redoStorageExists()){
+			$sender->sendMessage($this->getWarning() . Translation::get(Translation::COMMANDS_REDO_NO_REDO));
+
+			return;
+		}
+
+		$redoAmount = 1;
+		if(isset($args[0])){
+			$redoAmount = (int) $args[0];
+			if($redoAmount > ($totalRedo = SessionManager::getPlayerSession($sender)->getRevertStore()->getTotalStores(Revert::TYPE_REDO))){
+				$redoAmount = $totalRedo;
+			}
+		}
+		SessionManager::getPlayerSession($sender)->getRevertStore()->restoreLatestRevert(Revert::TYPE_REDO, $redoAmount);
+		$sender->sendMessage(TF::GREEN . Translation::get(Translation::COMMANDS_REDO_SUCCESS) . TF::AQUA . " (" . $redoAmount . ")");
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\commands\cloning;
+
+use BlockHorizons\BlockSniper\cloning\types\CopyType;
+use BlockHorizons\BlockSniper\cloning\types\TemplateType;
+use BlockHorizons\BlockSniper\commands\BaseCommand;
+use BlockHorizons\BlockSniper\data\Translation;
+use BlockHorizons\BlockSniper\exceptions\InvalidBlockException;
+use BlockHorizons\BlockSniper\Loader;
+use BlockHorizons\BlockSniper\sessions\SessionManager;
+use BlockHorizons\libschematic\Schematic;
+use pocketmine\command\CommandSender;
+use pocketmine\Player;
+use pocketmine\utils\TextFormat;
+use pocketmine\utils\TextFormat as TF;
+
+class CloneCommand extends BaseCommand{
+
+	public function __construct(Loader $loader){
+		parent::__construct($loader, "clone", Translation::COMMANDS_CLONE_DESCRIPTION, "/clone <copy|schematic|template> [name]");
+	}
+
+	public function onExecute(CommandSender $sender, string $commandLabel, array $args) : void{
+		/** @var Player $sender */
+		if(!isset($args[0])){
+			$sender->sendMessage($this->getUsage());
+
+			return;
+		}
+
+		$center = $sender->getTargetBlock(100);
+		if($center === null){
+			throw new InvalidBlockException("No valid block could be found when attempting to clone.");
+		}
+
+		$session = SessionManager::getPlayerSession($sender);
+
+		if(!$session->getSelection()->ready()){
+			$sender->sendMessage(
+				TextFormat::RED . Translation::get(Translation::COMMANDS_COMMON_WARNING_PREFIX) .
+				Translation::get(Translation::BRUSH_SELECTION_ERROR)
+			);
+
+			return;
+		}
+
+		$size = SessionManager::getPlayerSession($sender)->getBrush()->size;
+		$shape = $session->getBrush()->getShape($session->getSelection()->box());
+
+		switch(strtolower($args[0])){
+			default:
+			case "copy":
+				$cloneType = new CopyType($sender, false, $center, $shape);
+				$cloneType->saveClone();
+				$sender->sendMessage(TF::GREEN . Translation::get(Translation::COMMANDS_CLONE_COPY_SUCCESS));
+
+				return;
+
+			case "template":
+				if(!isset($args[1])){
+					$sender->sendMessage($this->getWarning() . Translation::get(Translation::COMMANDS_CLONE_TEMPLATE_MISSING_NAME));
+
+					return;
+				}
+				$cloneType = new TemplateType($sender, false, $center, $shape, $args[1]);
+				$cloneType->saveClone();
+				$sender->sendMessage(TF::GREEN . Translation::get(Translation::COMMANDS_CLONE_TEMPLATE_SUCCESS, [$this->loader->getDataFolder() . "templates/" . $args[1] . ".template"]));
+
+				return;
+
+			case "scheme":
+			case "schem":
+			case "schematic":
+				if(!isset($args[1])){
+					$sender->sendMessage($this->getWarning() . Translation::get(Translation::COMMANDS_CLONE_SCHEMATIC_MISSING_NAME));
+
+					return;
+				}
+
+				$blocks = [];
+				foreach($shape->getBlocksInside() as $block){
+					$blocks[] = $block;
+				}
+
+				$schematic = new Schematic();
+				$schematic
+					->setBlocks($blocks)
+					->setMaterials(Schematic::MATERIALS_POCKET)
+					->encode()
+					->setLength($size * 2 + 1)
+					->setHeight($size * 2 + 1)
+					->setWidth($size * 2 + 1)
+					->save($this->loader->getDataFolder() . "schematics/" . $args[1] . ".schematic");
+				$sender->sendMessage(TF::GREEN . Translation::get(Translation::COMMANDS_CLONE_SCHEMATIC_SUCCESS, [$this->loader->getDataFolder() . "templates/" . $args[1] . ".schematic"]));
+		}
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\commands\cloning;
+
+use BlockHorizons\BlockSniper\commands\BaseCommand;
+use BlockHorizons\BlockSniper\data\Translation;
+use BlockHorizons\BlockSniper\exceptions\InvalidBlockException;
+use BlockHorizons\BlockSniper\Loader;
+use BlockHorizons\BlockSniper\sessions\SessionManager;
+use BlockHorizons\libschematic\Schematic;
+use pocketmine\command\CommandSender;
+use pocketmine\level\Level;
+use pocketmine\Player;
+use pocketmine\utils\TextFormat as TF;
+
+class PasteCommand extends BaseCommand{
+
+	public function __construct(Loader $loader){
+		parent::__construct($loader, "paste", Translation::COMMANDS_PASTE_DESCRIPTION, "/paste <copy|template|schematic> [name]");
+	}
+
+	public function onExecute(CommandSender $sender, string $commandLabel, array $args) : void{
+		/** @var Player $sender */
+		if(!isset($args[0])){
+			$sender->sendMessage($this->getUsage());
+
+			return;
+		}
+
+		$center = $sender->getTargetBlock(100);
+		if($center === null){
+			throw new InvalidBlockException("No valid block could be found when attempting to paste.");
+		}
+
+		$session = SessionManager::getPlayerSession($sender);
+
+		switch(strtolower($args[0])){
+			default:
+			case "copy":
+				if(!$session->getCloneStore()->copyStoreExists()){
+					$sender->sendMessage($this->getWarning() . Translation::get(Translation::COMMANDS_PASTE_COPY_NO_COPIES));
+
+					return;
+				}
+				$session->getCloneStore()->pasteCopy($center);
+				$sender->sendMessage(TF::GREEN . Translation::get(Translation::COMMANDS_PASTE_COPY_SUCCESS));
+
+				return;
+
+			case "template":
+				if(!isset($args[1])){
+					$sender->sendMessage($this->getWarning() . Translation::get(Translation::COMMANDS_CLONE_TEMPLATE_MISSING_NAME));
+
+					return;
+				}
+				if(!$session->getCloneStore()->templateExists($args[1])){
+					$sender->sendMessage($this->getWarning() . Translation::get(Translation::COMMANDS_PASTE_TEMPLATE_NONEXISTENT, [$args[1]]));
+
+					return;
+				}
+				$session->getCloneStore()->pasteTemplate($args[1], $center);
+				$sender->sendMessage(TF::GREEN . Translation::get(Translation::COMMANDS_PASTE_TEMPLATE_SUCCESS, [$args[1]]));
+
+				return;
+
+			case "schematic":
+				if(!isset($args[1])){
+					$sender->sendMessage($this->getWarning() . Translation::get(Translation::COMMANDS_CLONE_SCHEMATIC_MISSING_NAME));
+
+					return;
+				}
+				if(!is_file($file = $this->loader->getDataFolder() . "schematics/" . $args[1] . ".schematic")){
+					$sender->sendMessage($this->getWarning() . Translation::get(Translation::COMMANDS_PASTE_SCHEMATIC_NONEXISTENT, [$args[1]]));
+
+					return;
+				}
+				$schematic = new Schematic($file);
+				$schematic->decodeSizes();
+
+				$width = $schematic->getWidth();
+				$length = $schematic->getLength();
+				$touchedChunks = [];
+				for($x = $center->x - $width / 2; $x <= $center->x + $width / 2 + 16; $x += 16){
+					for($z = $center->z - $length / 2; $z <= $center->z + $length / 2 + 16; $z += 16){
+						$chunk = $sender->getLevel()->getChunk($x >> 4, $z >> 4, true);
+						if($chunk === null){
+							continue;
+						}
+						$touchedChunks[Level::chunkHash($x >> 4, $z >> 4)] = $chunk->fastSerialize();
+					}
+				}
+				$session->getCloneStore()->pasteSchematic($file, $center->asVector3(), $touchedChunks);
+				$sender->sendMessage(TF::GREEN . Translation::get(Translation::COMMANDS_PASTE_SCHEMATIC_SUCCESS, [$args[1]]));
+		}
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\listeners;
+
+use BlockHorizons\BlockSniper\brush\Brush;
+use BlockHorizons\BlockSniper\data\Translation;
+use BlockHorizons\BlockSniper\Loader;
+use BlockHorizons\BlockSniper\sessions\SessionManager;
+use BlockHorizons\BlockSniper\tasks\SessionDeletionTask;
+use BlockHorizons\BlockSniper\ui\windows\BrushMenuWindow;
+use MyPlot\PlotLevelSettings;
+use pocketmine\block\Block;
+use pocketmine\event\block\BlockBreakEvent;
+use pocketmine\event\Listener;
+use pocketmine\event\player\PlayerInteractEvent;
+use pocketmine\event\player\PlayerItemHeldEvent;
+use pocketmine\event\player\PlayerQuitEvent;
+use pocketmine\math\Vector2;
+use pocketmine\Player;
+use pocketmine\utils\TextFormat;
+
+class BrushListener implements Listener{
+
+	/** @var Loader */
+	private $loader = null;
+
+	public function __construct(Loader $loader){
+		$this->loader = $loader;
+	}
+
+	/**
+	 * @param PlayerInteractEvent $event
+	 */
+	public function brush(PlayerInteractEvent $event) : void{
+		$player = $event->getPlayer();
+		if(!$player->hasPermission("blocksniper.command.brush")){
+			return;
+		}
+		$hand = $player->getInventory()->getItemInHand();
+		$brushItem = $this->loader->config->brushItem->parse();
+		if($hand->getId() !== $brushItem->getId() || $hand->getDamage() !== $brushItem->getDamage()){
+			return;
+		}
+
+		$brush = ($session = SessionManager::getPlayerSession($player))->getBrush();
+		if($brush->mode === Brush::MODE_SELECTION){
+			if(!$session->getSelection()->ready()){
+				$player->sendMessage(
+					TextFormat::RED . Translation::get(Translation::COMMANDS_COMMON_WARNING_PREFIX) .
+					Translation::get(Translation::BRUSH_SELECTION_ERROR)
+				);
+
+				return;
+			}
+		}
+
+		$selection = $brush->mode === Brush::MODE_BRUSH ? null : $session->getSelection();
+
+		$brush->execute($session, $selection, $this->getPlotPoints($player));
+		$event->setCancelled();
+	}
+
+	/**
+	 * @param Player $player
+	 * @param Block  $block
+	 * @param int    $action
+	 *
+	 * @return bool
+	 */
+	private function selection(Player $player, Block $block, int $action) : bool{
+		if(!$player->hasPermission("blocksniper.command.brush")){
+			return false;
+		}
+		$selectionItem = $this->loader->config->selectionItem->parse();
+		$hand = $player->getInventory()->getItemInHand();
+		if($hand->getId() !== $selectionItem->getId() || $hand->getDamage() !== $selectionItem->getDamage()){
+			return false;
+		}
+
+		$selection = ($session = SessionManager::getPlayerSession($player))->getSelection();
+		$vec = $block->asVector3();
+		[$x, $y, $z] = [$vec->x, $vec->y, $vec->z];
+		switch($action){
+			case PlayerInteractEvent::RIGHT_CLICK_BLOCK:
+				$selection->setFirstPos($vec);
+				$msg = Translation::get(Translation::BRUSH_SELECTION_FIRST) . " ($x, $y, $z)";
+				$player->sendMessage(TextFormat::GREEN . $msg);
+
+				return true;
+			case PlayerInteractEvent::LEFT_CLICK_BLOCK:
+				$selection->setSecondPos($vec);
+				$msg = Translation::get(Translation::BRUSH_SELECTION_SECOND) . " ($x, $y, $z)";
+				$player->sendMessage(TextFormat::GREEN . $msg);
+
+				return true;
+		}
+
+		return false;
+	}
+
+	/**
+	 * @param PlayerInteractEvent $event
+	 */
+	public function onBlockClick(PlayerInteractEvent $event) : void{
+		if($this->selection($event->getPlayer(), $event->getBlock(), $event->getAction())){
+			$event->setCancelled();
+		}
+	}
+
+	/**
+	 * @param BlockBreakEvent $event
+	 */
+	public function onBlockBreak(BlockBreakEvent $event) : void{
+		if($this->selection($event->getPlayer(), $event->getBlock(), PlayerInteractEvent::LEFT_CLICK_BLOCK)){
+			$event->setCancelled();
+		}
+	}
+
+	/**
+	 * @param Player $player
+	 *
+	 * @return Vector2[][]
+	 */
+	public function getPlotPoints(Player $player) : array{
+		if($player->hasPermission("blocksniper-myplot.bypass") || !$this->loader->isMyPlotAvailable()){
+			return [];
+		}
+		$plotPoints = [];
+		$settings = $this->loader->getMyPlot()->getLevelSettings($player->getLevel()->getName());
+		if($settings === null){
+			if($player->hasPermission("blocksniper-myplot.allow-outside")){
+				return [];
+			}
+
+			return [[new Vector2(), new Vector2()]];
+		}
+		$plotSize = $settings->plotSize;
+		foreach($this->loader->getMyPlot()->getPlotsOfPlayer($player->getName(), $player->getLevel()->getFolderName()) as $plot){
+			$minVec = new Vector2($this->calcActual($plot->X, $settings) - $plotSize, $this->calcActual($plot->Z, $settings) - $plotSize);
+			$maxVec = new Vector2($this->calcActual($plot->X, $settings) - 1, $this->calcActual($plot->Z, $settings) - 1);
+			$plotPoints[] = [$minVec, $maxVec];
+		}
+		if(empty($plotPoints)){
+			return [[new Vector2(), new Vector2()]];
+		}
+
+		return $plotPoints;
+	}
+
+	/**
+	 * @param int               $coordinate
+	 * @param PlotLevelSettings $settings
+	 *
+	 * @return int
+	 */
+	private function calcActual(int $coordinate, PlotLevelSettings $settings) : int{
+		$coordinate += 1;
+
+		return $coordinate * $settings->plotSize + ($coordinate - 1) * $settings->roadWidth;
+	}
+
+	/**
+	 * @param PlayerItemHeldEvent $event
+	 */
+	public function onItemHeld(PlayerItemHeldEvent $event) : void{
+		$player = $event->getPlayer();
+		$brush = $this->loader->config->brushItem->parse();
+		if($event->getItem()->getId() === $brush->getId() && $event->getItem()->getDamage() === $brush->getDamage()){
+			if($player->hasPermission("blocksniper.command.brush")){
+				$player->sendForm(new BrushMenuWindow($this->loader, $player));
+			}
+		}
+	}
+
+	/**
+	 * @param PlayerQuitEvent $event
+	 */
+	public function onQuit(PlayerQuitEvent $event) : void{
+		if(!SessionManager::playerSessionExists($event->getPlayer()->getName())){
+			return;
+		}
+		$this->loader->getScheduler()->scheduleDelayedTask(
+			new SessionDeletionTask($this->loader, SessionManager::getPlayerSession($event->getPlayer())),
+			$this->loader->config->sessionTimeoutTime * 20 * 60
+		);
+	}
+}
+<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\tasks;
+
+use BlockHorizons\BlockSniper\revert\Revert;
+use BlockHorizons\BlockSniper\sessions\SessionManager;
+
+class UndoDiminishTask extends BlockSniperTask{
+
+	public function onRun(int $currentTick) : void{
+		foreach($this->loader->getServer()->getOnlinePlayers() as $player){
+			if(!SessionManager::playerSessionExists($player->getName())){
+				continue;
+			}
+			if(($store = SessionManager::getPlayerSession($player)->getRevertStore())->undoStorageExists()){
+				if($store->getLastUndoActivity() >= 180){
+					$store->unsetOldestRevert(Revert::TYPE_UNDO);
+				}
+			}
+		}
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\tasks;
+
+use BlockHorizons\BlockSniper\Loader;
+use pocketmine\scheduler\Task;
+
+abstract class BlockSniperTask extends Task{
+
+	/** @var Loader */
+	protected $loader = null;
+
+	public function __construct(Loader $loader){
+		$this->loader = $loader;
+	}
+
+	/**
+	 * @return Loader
+	 */
+	public function getLoader() : Loader{
+		return $this->loader;
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\tasks;
+
+use BlockHorizons\BlockSniper\revert\Revert;
+use BlockHorizons\BlockSniper\sessions\SessionManager;
+
+class RedoDiminishTask extends BlockSniperTask{
+
+	public function onRun(int $currentTick) : void{
+		foreach($this->loader->getServer()->getOnlinePlayers() as $player){
+			if(!SessionManager::playerSessionExists($player->getName())){
+				continue;
+			}
+			if(($store = SessionManager::getPlayerSession($player)->getRevertStore())->redoStorageExists()){
+				if($store->getLastRedoActivity() >= 180){
+					$store->unsetOldestRevert(Revert::TYPE_REDO);
+				}
+			}
+		}
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace BlockHorizons\BlockSniper\sessions;
+
+use BlockHorizons\BlockSniper\Loader;
+use BlockHorizons\BlockSniper\sessions\owners\PlayerSessionOwner;
+use pocketmine\Player;
+
+class SessionManager{
+
+	/** @var PlayerSession[] */
+	private static $playerSessions = [];
+
+	public static function close() : void{
+		foreach(self::$playerSessions as $session){
+			$session->close();
+		}
+	}
+
+	/**
+	 * @param Player $player
+	 *
+	 * @return PlayerSession|null
+	 */
+	public static function getPlayerSession(Player $player) : ?PlayerSession{
+		if($player->hasPermission("blocksniper.command.brush")){
+			/** @var Loader $plugin */
+			$plugin = $player->getServer()->getPluginManager()->getPlugin("BlockSniper");
+			self::createPlayerSession($player->getName(), $plugin);
+		}
+
+		return self::$playerSessions[$player->getName()] ?? null;
+	}
+
+	/**
+	 * @param string $playerName
+	 * @param Loader $loader
+	 */
+	public static function createPlayerSession(string $playerName, Loader $loader) : void{
+		if(self::playerSessionExists($playerName)){
+			return;
+		}
+		self::$playerSessions[$playerName] = new PlayerSession(new PlayerSessionOwner($playerName), $loader);
+	}
+
+	/**
+	 * @param string $playerName
+	 *
+	 * @return bool
+	 */
+	public static function playerSessionExists(string $playerName) : bool{
+		return isset(self::$playerSessions[$playerName]);
+	}
+
+	/**
+	 * @param string $playerName
+	 */
+	public static function closeSession(string $playerName) : void{
+		if(self::playerSessionExists($playerName)){
+			self::$playerSessions[$playerName]->close();
+			unset(self::$playerSessions[$playerName]);
+		}
+	}
+}<?php
+
+declare(strict_types=1);
+
+namespace Sandertv\Marshal;
+
+class Marshal{
+
+	/**
+	 * json encodes $obj to JSON and returns it, using the provided $options.
+	 *
+	 * @param \object $obj to encode to JSON.
+	 * @param int     $options for changing the output JSON.
+	 * @param int     $depth maximum nesting depth, must be greater than 0.
+	 *
+	 * @return string of JSON.
+	 */
+	public static function json(object $obj, int $options = 0, int $depth = 512) : string{
+		return json_encode(self::processMarshalTags($obj), $options, $depth);
+	}
+
+	/**
+	 * jsonFile encodes $obj to JSON and returns it using the provided $options. The output is written to $file.
+	 *
+	 * @param string  $file to write the JSON string to.
+	 * @param \object $obj to encode to JSON.
+	 * @param int     $options for changing the output JSON.
+	 * @param int     $depth maximum nesting depth, must be greater than 0.
+	 */
+	public static function jsonFile(string $file, object $obj, int $options = 0, int $depth = 512) : void{
+		file_put_contents($file, self::json($obj, $options, $depth));
+	}
+
+	/**
+	 * yaml encodes $obj to YAML and returns it, using $encoding and $linebreak according to the specifications of YAML.
+	 *
+	 * @param \object $obj to encode to YAML.
+	 * @param int     $encoding to use to encode $obj.
+	 * @param int     $linebreak to use for newlines.
+	 *
+	 * @return string of YAML encoded data.
+	 */
+	public static function yaml(object $obj, int $encoding = YAML_ANY_ENCODING, int $linebreak = YAML_ANY_BREAK) : string{
+		// YAML, unlike JSON, cannot write PHP objects properly, so we first change all objects to arrays.
+		return yaml_emit(self::objToArray(self::processMarshalTags($obj)), $encoding, $linebreak);
+	}
+
+	/**
+	 * yaml encodes $obj to YAML and writes it to $file, using $encoding and $linebreak according to the specifications
+	 * of YAML.
+	 *
+	 * @param string  $file to write the encoded YAML to.
+	 * @param \object $obj to encode to YAML.
+	 * @param int     $encoding to use to encode $obj.
+	 * @param int     $linebreak to use for newlines.
+	 */
+	public static function yamlFile(string $file, object $obj, int $encoding = YAML_ANY_ENCODING, int $linebreak = YAML_ANY_BREAK) : void{
+		file_put_contents($file, self::yaml($obj, $encoding, $linebreak));
+	}
+
+	/**
+	 * objToArray converts an object to an array, so that functions such as yaml_emit can use them.
+	 *
+	 * @param mixed $obj
+	 *
+	 * @return mixed
+	 */
+	private static function objToArray($obj){
+		if(is_object($obj)){
+			$obj = get_object_vars($obj);
+		}
+		if(is_array($obj)){
+			return array_map('self::objToArray', $obj);
+		}
+
+		return $obj;
+	}
+
+	/**
+	 * @param \object $obj
+	 *
+	 * @return \object
+	 */
+	private static function processMarshalTags(object $obj) : object{
+		$c = clone($obj);
+		$refl = new \ReflectionObject($c);
+		foreach($refl->getProperties() as $property){
+			if(!$property->isPublic()){
+				continue;
+			}
+			$propertyName = $property->name;
+			$value = $property->getValue($c);
+			unset($c->{$propertyName});
+			// Cast the property name to a string because an array with numeric indexes casted to an object may have
+			// integer keys, which causes issues.
+			$tags = DataProcessor::parseDocComment($refl->getProperty((string) $propertyName)->getDocComment());
+			if(isset($tags[DataProcessor::TAG_MARSHAL])){
+				$propertyName = $tags[DataProcessor::TAG_MARSHAL];
+				if($propertyName === "-"){
+					// Leave properties with '-' as marshal name unset and don't set the tag. We created a clone of the
+					// object, so we do not need to set it back.
+					continue;
+				}
+			}
+			if(is_object($value)){
+				$value = self::processMarshalTags($value);
+			}elseif(is_array($value)){
+				// Cast the array to an object and process it recursively in case this array contained any objects, and
+				// cast it back to an array immediately after.
+				$value = (array) self::processMarshalTags((object) $value);
+			}
+			$c->{$propertyName} = $value;
+		}
+
+		return $c;
+	}
+}

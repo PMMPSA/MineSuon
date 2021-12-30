@@ -1,0 +1,179 @@
+# Lunar Anticheat Configure File
+# Alert Message Prefix
+Prefix: "§l§f[§cAntiHack§f]"
+# Alert Message format (with prefix)
+#  Available Variable [MSG, DETECTION_NAME, PLAYER_NAME, MAX_VL, VL, PRE_VL, PUNISHMENT, PUNISHMENT_STRING]
+Format: "⨞ §c[DETECTION_NAME] §f:§e [MSG]"
+# Replace Config file by default
+Replace: true
+# In-Game CPS TAG
+CPSTag: true
+# Punishment(BAN, KICK, ALERT, IGNORE)
+
+# Check for wrong edition provided and DeviceModel
+ClientDataFaker:
+  Enable: true
+  Punishment: BAN
+  DeviceOS:
+    - 1
+    - 2
+    - 7
+  DeviceModel:
+    - "EZ4H"
+
+# Check for toolbox and DeviceModel
+AntiToolBox:
+  Enable: true
+  Punishment: KICK
+
+# Action
+
+# break too many block in 20ms
+NukerA:
+  Enable: true
+  Punishment: BAN
+  MaxVL: 10
+  # Max Block Breaks in 20ms
+  MaxBlock: 3
+
+# Break block faster than prediction
+FastBreakA:
+  Enable: true
+  Punishment: ALERT
+  MaxVL: 10
+
+# Basic high CPS with a certain limit
+AutoClicker:
+  Enable: true
+  Punishment: BAN
+  MaxVL: 10
+  # Max CPS
+  MaxCPS: 25
+  Reward: 0.988
+
+
+# Combat
+
+# Check for slapper hit
+KillAuraA:
+  Enable: false
+  MaxVL: 10
+  Punishment: KICK
+  AttackCooldown: 3
+  Radius: 3
+  Random:
+    Y:
+      Min: -1
+      Max: 3
+
+# Check for attack without swing arm
+KillAuraB:
+  Enable: true
+  Punishment: KICK
+  MaxVL: 10
+  SwingDuration: 0.3
+
+# Check for attack multiple entity with impossible count
+MultiAura:
+  Enable: true
+  Punishment: BAN
+  MaxVL: 10
+  MaxEntityHit: 4
+
+# Basic attack distance check
+ReachA:
+  Enable: true
+  Punishment: ALERT
+  MaxVL: 10
+
+# Check for vertical velocity
+VelocityB:
+  Enable: false
+  Punishment: ALERT
+  MaxVL: 10
+
+
+# Movement
+
+# Checks for horizontal friction
+SpeedA:
+  Enable: false
+  Punishment: KICK
+  MaxVL: 10
+  Suppress: false
+  MaxDiff: 0.000000000001
+  Reward: 0.888
+
+# Basic verbose speed check
+SpeedC:
+  Enable: true
+  Punishment: KICK
+  MaxVL: 10
+  Suppress: false
+  Reward: 0.1
+
+
+# Check for flight's that don't obey gravity.
+FlyA:
+  Enable: false
+  Punishment: KICK
+  MaxVL: 10
+  Suppress: false
+  Reward: 0.888
+
+# Basic AirJump check
+FlyB:
+  Enable: true
+  Punishment: KICK
+  MaxVL: 10
+  Suppress: false
+  Reward: 0.85
+
+# Checks for small vertical movement.
+FlyE:
+  Enable: true
+  Punishment: KICK
+  MaxVL: 10
+  Suppress: false
+  MaxDiff: 0.01
+  Reward: 0.88
+
+#  Check for invalid vertical acceleration. Like HighJump
+MotionB:
+  Enable: false
+  Punishment: KICK
+  MaxVL: 10
+
+#  Check for swimming in air
+AirSwim:
+  Enable: false
+  Punishment: KICK
+  MaxVL: 10
+  Suppress: false
+
+#  Check for movement when the player is immobile
+AntiImmobile:
+  Enable: false
+  Punishment: ALERT
+  MaxVL: 10
+  Suppress: false
+
+# Network
+
+#  Check for invalid self hit action
+BadPacketA:
+  Enable: true
+  Punishment: BAN
+  MaxVL: 10
+
+#  Check for invalid movement packet
+BadPacketB:
+  Enable: true
+  Punishment: BAN
+  MaxVL: 10
+
+#  Check for chat when move
+BadPacketC:
+  Enable: false
+  Punishment: KICK
+  MaxVL: 10

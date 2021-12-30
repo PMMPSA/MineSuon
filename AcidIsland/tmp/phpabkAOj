@@ -1,0 +1,25 @@
+name: AlwaysSpawn
+authors: [Philip Shilling]
+version: 2.2.4
+api: [3.0.0]
+main: philipshilling\alwaysspawn\Loader
+load: STARTUP
+description: "Force your users to spawn every time they login!"<?php
+
+namespace philipshilling\alwaysspawn;
+
+use pocketmine\event\Listener;
+use pocketmine\event\player\PlayerLoginEvent;
+use pocketmine\plugin\PluginBase as Plugin;
+
+class Loader extends Plugin implements Listener{
+	public function onEnable(){
+		$this->getServer()->getPluginManager()->registerEvents($this, $this);
+		$this->getServer()->getLogger()->info("AlwaysSpawn Enabled!");
+	}
+
+	public function onPlayerLogin(PlayerLoginEvent $event){
+		$event->getPlayer()->teleport($this->getServer()->getDefaultLevel()->getSafeSpawn());
+	}
+
+}
